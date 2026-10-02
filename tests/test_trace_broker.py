@@ -15,6 +15,12 @@ from src.trace_viewer import broker, launcher
 
 
 class BrokerTests(unittest.TestCase):
+    def test_loopback_startup_does_not_require_reverse_dns(self):
+        with patch('socket.getfqdn', side_effect=AssertionError('Loopback must not use DNS')):
+            server = broker.BrokerServer(self.registry)
+            self.addCleanup(server.server_close)
+            self.assertEqual(server.server_name, '127.0.0.1')
+
     def test_oversized_state_is_rejected_before_replacing_good_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp)/'state.json'

@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import secrets
 import signal
+from socketserver import TCPServer
 import threading
 import time
 from urllib.parse import urlsplit
@@ -118,7 +119,14 @@ class RolloutReader:
                     "coverage": "Selected rollout only. Recent public events; structured completions appear when recorded. No internal reasoning or model-call timing. Unknown schemas omitted."}
 
 
-class ViewerServer(ThreadingHTTPServer):
+class LoopbackHTTPServer(ThreadingHTTPServer):
+    def server_bind(self):
+        # Numeric loopback endpoints need no potentially blocking reverse DNS.
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
+class ViewerServer(LoopbackHTTPServer):
     daemon_threads = True
 
     def __init__(self, reader, port=0):

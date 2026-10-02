@@ -5,7 +5,6 @@ from collections import OrderedDict
 import fcntl
 import hashlib
 import hmac
-from http.server import ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
@@ -19,9 +18,9 @@ import time
 from urllib.parse import urlsplit, parse_qs
 
 try:
-    from .server import Handler as BaseHandler, RolloutReader
+    from .server import Handler as BaseHandler, RolloutReader, LoopbackHTTPServer
 except ImportError:
-    from server import Handler as BaseHandler, RolloutReader
+    from server import Handler as BaseHandler, RolloutReader, LoopbackHTTPServer
 
 THREAD = re.compile(r'[a-zA-Z0-9][a-zA-Z0-9_-]{0,100}')
 MAX_READERS = 8
@@ -157,7 +156,7 @@ class Registry:
             return result
 
 
-class BrokerServer(ThreadingHTTPServer):
+class BrokerServer(LoopbackHTTPServer):
     daemon_threads = True
 
     def __init__(self, registry, port=0):

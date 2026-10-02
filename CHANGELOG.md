@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.1 - 2026-10-03
+
+### Fixed
+- Removed reverse DNS from numeric loopback server binding. macOS CI captured
+  the broker blocked in `socket.getfqdn` before writing its service record;
+  increasing the startup timeout would only hide that dependency.
+- Both shared and manual viewers now use the bound numeric address directly.
+  Two regression tests reject any DNS lookup during server construction.
+- Removed temporary CI stack diagnostics after identifying the cause. Existing
+  timeout, authentication, containment and hook failure behavior are unchanged.
+
 ## 0.1.0 - 2026-10-03
 
 Initial experimental public release.

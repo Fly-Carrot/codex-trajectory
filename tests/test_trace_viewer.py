@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -203,6 +204,12 @@ class ReaderTests(unittest.TestCase):
 
 
 class SecurityTests(unittest.TestCase):
+    def test_loopback_startup_does_not_require_reverse_dns(self):
+        with patch('socket.getfqdn', side_effect=AssertionError('Loopback must not use DNS')):
+            server = viewer.ViewerServer(None)
+            self.addCleanup(server.server_close)
+            self.assertEqual(server.server_name, '127.0.0.1')
+
     def test_compact_english_scroll_contract(self):
         html = Path(viewer.__file__).with_name('index.html').read_text()
         self.assertIn('<html lang="en">', html)

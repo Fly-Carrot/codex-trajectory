@@ -169,7 +169,7 @@ and self-contained HTML/CSS/JS. No npm install, CDN, telemetry or remote font.
 
 ## Status and credits
 
-**v0.1.0: experimental standalone observer.** Rollout schemas and hook support
+**v0.1.1: experimental standalone observer.** Rollout schemas and hook support
 vary by Codex version. Automated tests cover fixtures and installation boundaries,
 not every host/version. Global auto-registration still needs a host-trusted hook.
 
