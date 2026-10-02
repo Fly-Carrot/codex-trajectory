@@ -17,4 +17,22 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - name: Diagnose isolated broker startup
+        if: runner.os == 'macOS'
+        run: |
+          python - <<'PY'
+          import json, pathlib, subprocess, sys, tempfile, time
+          with tempfile.TemporaryDirectory() as tmp:
+              root = pathlib.Path(tmp)
+              (root/'sessions').mkdir()
+              child = subprocess.Popen([sys.executable, '-c',
+                  'import faulthandler,runpy; faulthandler.dump_traceback_later(2,repeat=True); runpy.run_path("src/trace_viewer/broker.py",run_name="__main__")',
+                  '--sessions',str(root/'sessions'),'--state-dir',str(root/'state')],
+                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+              time.sleep(6)
+              print('service_record_exists', (root/'state/service.json').exists(), 'child_exit', child.poll())
+              child.terminate()
+              _, errors = child.communicate(timeout=5)
+              print(errors)
+          PY
       - run: python -B -m unittest discover -s tests -v
