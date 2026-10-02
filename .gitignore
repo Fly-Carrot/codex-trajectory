@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+.DS_Store
+.knowledgeos-local/
+*.jsonl
+*.ndjson
+connection.json
+service.json
+registry.json
+installation.json
+backups/
+.env*
