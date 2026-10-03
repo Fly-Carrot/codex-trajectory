@@ -7,7 +7,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from src.trace_viewer.install import configure, BEGIN
+from src.trace_viewer.install import configure, BEGIN, END, strip_rule
 
 
 class InstallTests(unittest.TestCase):
@@ -73,6 +73,79 @@ class InstallTests(unittest.TestCase):
         configure(self.home)
         configure(self.home, uninstall=True)
         self.assertEqual((self.home/'AGENTS.md').read_text(), self.rules)
+
+    def test_reinstall_preserves_outside_edits_on_uninstall(self):
+        path = self.home/'AGENTS.md'
+        configure(self.home)
+        changed = 'New prefix\r\n' + path.read_text().replace('Keep this exactly.', 'Updated rule.') + '\nNew suffix\n'
+        path.write_bytes(changed.encode())
+        expected = strip_rule(changed).encode()
+        configure(self.home)
+        configure(self.home)
+        configure(self.home, uninstall=True)
+        self.assertEqual(path.read_bytes(), expected)
+
+    def test_reinstall_restores_exact_bytes_when_only_owned_block_changes(self):
+        path = self.home/'AGENTS.md'
+        for original in (b'', b'No final newline', b'\xef\xbb\xbf# Rules\r\nKeep tabs\t\r\n'):
+            with self.subTest(original=original):
+                path.write_bytes(original)
+                configure(self.home)
+                text = path.read_bytes().decode()
+                start, end = text.index(BEGIN) + len(BEGIN), text.index(END)
+                path.write_bytes((text[:start] + '\nChanged owned instructions\n' + text[end:]).encode())
+                configure(self.home)
+                configure(self.home)
+                configure(self.home, uninstall=True)
+                self.assertEqual(path.read_bytes(), original)
+
+    def test_legacy_reinstall_snapshot_cannot_authorize_restoring_old_prose(self):
+        path = self.home/'AGENTS.md'
+        configure(self.home)
+        changed = path.read_text() + '\nUser rule added before legacy upgrade\n'
+        path.write_text(changed)
+        manifest = self.home/'codex-trajectory/installation.json'
+        old = json.loads(manifest.read_text())
+        manifest.write_text(json.dumps({key: old[key] for key in
+            ('hook_command', 'original_rules', 'uninstalled')} | {'installed_rules': changed}))
+        configure(self.home)
+        configure(self.home, uninstall=True)
+        self.assertEqual(path.read_bytes(), strip_rule(changed).encode())
+
+    def test_new_install_cycle_uses_current_original_bytes(self):
+        path = self.home/'AGENTS.md'
+        configure(self.home)
+        configure(self.home, uninstall=True)
+        original = b'New rules after uninstall\r\n'
+        path.write_bytes(original)
+        configure(self.home)
+        configure(self.home)
+        configure(self.home, uninstall=True)
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_moved_block_does_not_erase_changed_surrounding_bytes(self):
+        path = self.home/'AGENTS.md'
+        configure(self.home)
+        text = path.read_text()
+        block = text[text.index(BEGIN):text.index(END) + len(END)]
+        changed = block + strip_rule(text)
+        path.write_text(changed)
+        configure(self.home)
+        configure(self.home, uninstall=True)
+        self.assertEqual(path.read_bytes(), strip_rule(changed).encode())
+
+    def test_legacy_unchanged_rules_still_restore_exact_bytes(self):
+        path = self.home/'AGENTS.md'
+        original = b'\xef\xbb\xbfOriginal\r\n'
+        path.write_bytes(original)
+        configure(self.home)
+        manifest = self.home/'codex-trajectory/installation.json'
+        old = json.loads(manifest.read_text())
+        old.pop('original_outside_rules', None)
+        manifest.write_text(json.dumps(old))
+        configure(self.home)
+        configure(self.home, uninstall=True)
+        self.assertEqual(path.read_bytes(), original)
 
     def test_malformed_config_is_not_overwritten(self):
         (self.home/'hooks.json').write_text('{broken')

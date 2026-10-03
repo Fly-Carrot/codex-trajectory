@@ -17,11 +17,15 @@ No API key. No KnowledgeOS dependency.
 
 ## What you get
 
-- One compact timeline row per present category. No empty tracks.
+- Twelve compact category rows in a fixed order, including empty rows. No activity hints.
 - Shared horizontal scrolling, event-order / clock-time views, zoom and live follow.
 - A chronological ledger with searchable previews and click-to-inspect details.
-- **Output** appears below Other Tools at the recorded return time. It is a linked
+- **Tool Results** appears below Other Tools at the recorded return time. It is a linked
   view of a result, not a second tool call or proof that a side effect succeeded.
+- **Artifacts** shows existing workspace report files explicitly linked in final
+  replies, above **Agent**. This verifies existence, not who created the file.
+- **Agent** distinguishes Progress / Final messages; **Subagents** is separate.
+- Tool badges show Skill (loaded) or Plugin only when supported by source evidence.
 - One private URL per chat; exact transcript binding, never "the latest log".
 - Optional global hook registers chats and supplies their link to Codex. A small
   English instruction asks Codex to append that link to its final reply.
@@ -46,6 +50,9 @@ The installer copies the small runtime to `$CODEX_HOME/codex-trajectory` (defaul
 custom instructions, `config.toml`, notify handlers and the app bundle are left
 alone. Original hook/rule files are backed up privately before modification.
 Re-running installation is idempotent.
+
+Installation does not terminate an already-running observer. Updated runtime
+files take effect on its next start; retrieve a fresh verified link then.
 
 **Review and trust the new hook in Codex `/hooks`.** Installation does not trust
 it for you. Resume/start a conversation after reviewing it if the current client
@@ -92,27 +99,42 @@ python3 trajectory.py --thread-id THREAD_ID --log /absolute/path/to/exact-rollou
 
 Open the returned private URL when needed. `--auto-open` is an explicit macOS
 convenience, never the default. A resumed chat with a new physical log must be
-registered again with that exact path. The viewer shows the selected rollout,
-not reconstructed lifetime history across all old files.
+registered again with that exact path. The shared viewer retains previously
+registered segments and discovers matching filenames on first registration,
+validating each file's thread identity before including it. It cannot recover
+source logs that Codex or the user has already removed.
 
 ## Event semantics
 
 | Track | Meaning |
 | --- | --- |
 | User | Recorded user message |
-| Assistant | Public progress/final message, not hidden reasoning |
 | Command | Structured shell command and recorded execution status |
 | File | Recorded file-change operation, not independent artifact verification |
 | MCP | MCP server/tool, arguments, text result and recorded status |
-| Agent | Dispatch/wait/collaboration operation, not a count of successful agents |
+| Subagents | Dispatch/wait/collaboration operation, not a count of successful agents |
 | Context | A compaction event; internal context is not shown |
-| Plan / Search | Supported structured items, only when the source contains them |
+| Plan | Structured Plan-mode proposals; plain prose and turn/plan/updated notifications are not inferred |
+| Search | Native WebSearch/webSearch or Extension/web.search items; browser MCP and shell browsing keep their original categories |
 | Other Tools | Other recorded function/custom-tool operations |
-| Output | Linked result preview at a known return/completion timestamp |
+| Tool Results | Linked result preview at a known return/completion timestamp |
+| Artifacts | Final-reply references to existing regular report files inside the session workspace |
+| Agent | Public Progress / Final messages, not hidden reasoning; always the last present track |
 
 Turn boundaries span tracks. Failures are red in their original track. Same-ID
 starts/results/completions merge; distinct wrapper and nested calls stay distinct.
-Output adds a visible marker/ledger row without inflating operation counts.
+Tool Results adds a visible marker/ledger row without inflating operation counts.
+Known successful exec wrapper result projections are folded by default; the
+Wrapper results toggle restores them. Errors and unknown results remain visible.
+Original events and their redacted, bounded previews remain in the inspector.
+Artifacts use the final-reference timestamp, not an inferred creation time. At
+most 32 references are checked per history page, prioritizing recent final replies;
+opening a message checks up to 16 references. Code blocks, external URLs, source-code
+files, symlinks and paths outside the recorded workspace are excluded. Files are
+not downloaded or served. This is a bounded reference view, not a complete file inventory.
+Skill badges require a successful single-file skill read and mean loaded, not
+executed. Plugin badges require explicit structured provenance; names in tool
+arguments or results do not count. Logs without provenance have no such badge.
 Timeline mark widths do not imply duration. Only recorded operation duration is
 shown in details; no internal model latency is inferred. Reading a skill file
 does not prove that the skill was executed. Unsupported schemas are omitted.
@@ -124,15 +146,38 @@ Codex UserPromptSubmit hook
   -> exact thread ID + transcript path
   -> one shared loopback broker
   -> private per-chat URL supplied to the agent
-  -> browser requests recent public events only while visible
+  -> private, rebuildable per-chat SQLite index
+  -> browser requests bounded history pages only while visible
 ```
 
 The observer reads local JSONL transcripts, not an App Server writer connection.
 It polls at 1.5 seconds while visible. Hidden tabs use a lightweight 30-second
 status check without reading logs. At most eight readers are cached; idle caches
-expire after two minutes. An unused service exits after one hour. Each reader
-starts in the last 2 MiB and keeps at most 160 canonical events plus linked output
-views. Old history may be absent; this is not an archival or audit system.
+expire after two minutes. An unused service exits after one hour. The embedded
+SQLite index uses Python's standard library, not another database service.
+Each source starts near its last 2 MiB; older ranges are indexed incrementally.
+At most eight source chunks are processed per request. Chat readers use separate
+locks, so one chat's parsing does not hold the shared registry lock.
+
+Pages contain the latest 20 recorded turns, capped at 300 canonical events.
+**Load earlier** becomes available after initial indexing; **Latest** returns to
+the live tail. A long first-time history may take several minutes to index.
+The browser retains at most 1,200 canonical events and virtualizes ledger rows.
+Continuing backward slides this window rather than refusing older history.
+Details load on click. View position is saved separately for each chat; transcript
+content and private URLs are not stored in that view-position record.
+
+Only bounded public summaries and source offsets/hashes are indexed. Original
+Codex logs remain read-only and are never automatically deleted. The disk index
+persists across service restarts and grows with observed history; this version has
+no automatic disk-quota cleanup. It is a cache, not an independent archive: full
+details still need the source log. Unsupported or oversized source records may be
+omitted and are reported in coverage statistics.
+
+Missing segments produce a visible incomplete-history warning while surviving
+segments remain readable. If all sources are unavailable, the viewer reports an
+error instead of substituting another chat. Index formats from earlier local
+pre-release builds are rebuilt once without changing source logs.
 
 ## Privacy and security
 
@@ -169,7 +214,7 @@ and self-contained HTML/CSS/JS. No npm install, CDN, telemetry or remote font.
 
 ## Status and credits
 
-**v0.1.1: experimental standalone observer.** Rollout schemas and hook support
+**v0.2.0: experimental standalone observer.** Rollout schemas and hook support
 vary by Codex version. Automated tests cover fixtures and installation boundaries,
 not every host/version. Global auto-registration still needs a host-trusted hook.
 

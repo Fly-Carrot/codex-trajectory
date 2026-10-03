@@ -5,15 +5,17 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import hashlib
 import os
 from pathlib import Path
 import re
 import secrets
 import signal
+import stat as stat_module
 from socketserver import TCPServer
 import threading
 import time
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, unquote
 
 try:
     from .events import normalize, public_text, redact, merge_event
@@ -24,6 +26,73 @@ except ImportError:
 WINDOW = 2 * 1024 * 1024
 MAX_LINE = 1024 * 1024
 MAX_EVENTS = 160
+REPORT_SUFFIXES = {'.md', '.html', '.pdf', '.docx', '.pptx', '.xlsx', '.csv', '.svg', '.png', '.jpg', '.jpeg', '.webp', '.mp4', '.wav'}
+
+
+def final_references(record):
+    payload = record['payload']
+    item = payload.get('item', payload)
+    text = public_text(item.get('content', item.get('text', '')))
+    text = re.sub(r'```.*?```|~~~.*?~~~|`[^`]*`', '', text, flags=re.S)
+    refs = []
+    for match in re.finditer(r'(?<!!)\[[^\]\n]*\]\((<[^>\n]+>|[^)\n]+)\)', text):
+        raw = match[1].strip().removeprefix('<').removesuffix('>')
+        try:
+            parsed = urlsplit(raw)
+            if parsed.scheme or parsed.netloc or parsed.query:
+                continue
+            path = unquote(parsed.path)
+            if path not in refs:
+                refs.append(path)
+        except ValueError:
+            continue
+        if len(refs) >= 16:
+            break
+    return refs
+
+
+def verified_reference(cwd, raw):
+    if not cwd or not cwd.is_absolute():
+        return None
+    path = Path(raw)
+    path = path if path.is_absolute() else cwd / path
+    try:
+        relative = path.relative_to(cwd)
+    except ValueError:
+        return None
+    if '..' in path.parts or path.suffix.lower() not in REPORT_SUFFIXES:
+        return None
+    # Walk from the filesystem root with no-follow directory handles. Never read
+    # deliverable contents or follow a swapped parent symlink outside the workspace.
+    fd = None
+    try:
+        fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
+        for part in path.parts[1:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        info = os.stat(path.name, dir_fd=fd, follow_symlinks=False)
+        if not stat_module.S_ISREG(info.st_mode):
+            return None
+        return {'id': hashlib.sha256(str(path).encode()).hexdigest()[:20],
+                'name': redact(path.name), 'path': redact(str(relative)), 'size': info.st_size,
+                'evidence': 'Referenced in final reply; file exists at refresh. Creation by this task is not verified.'}
+    except (OSError, ValueError):
+        return None
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def open_regular_source(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if not stat_module.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError('Source is not a regular file')
+        return os.fdopen(fd, 'rb')
+    except Exception:
+        os.close(fd)
+        raise
 
 
 class RolloutReader:
@@ -36,6 +105,8 @@ class RolloutReader:
         self.pending = b""
         self.dropping = False
         self.events = OrderedDict()
+        self.artifact_refs = OrderedDict()
+        self.cwd = None
         self.skipped = 0
         self.version = 0
         self.tail_limited = False
@@ -48,12 +119,16 @@ class RolloutReader:
     def validate_stream(self, stream):
         stream.seek(0)
         header = json.loads(stream.readline(8 * MAX_LINE))
+        if not isinstance(header, dict) or not isinstance(header.get('payload'), dict):
+            raise ValueError('Invalid source header')
         if header.get("type") != "session_meta" or header.get("payload", {}).get("id") != self.thread_id:
             raise ValueError("Rollout does not belong to the selected thread")
+        cwd = header['payload'].get('cwd')
+        self.cwd = Path(cwd) if isinstance(cwd, str) and cwd else None
 
     def open_source(self):
         # Refuse a file replaced with a symlink after registration.
-        return os.fdopen(os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW), "rb")
+        return open_regular_source(self.path)
 
     def snapshot(self):
         with self.lock:
@@ -64,6 +139,7 @@ class RolloutReader:
                 if self.identity != identity or stat.st_size < self.offset:
                     self.identity = identity
                     self.events.clear()
+                    self.artifact_refs.clear()
                     self.dropping = False
                     self.skipped = 0
                     self.offset = max(0, stat.st_size - WINDOW)
@@ -98,9 +174,14 @@ class RolloutReader:
                     event = normalize(record, location) if isinstance(record, dict) else None
                     if event:
                         key = event['id']
+                        if event.get('reply_phase') == 'Final':
+                            self.artifact_refs[key] = final_references(record)
+                            while sum(map(len, self.artifact_refs.values())) > 32 or len(self.artifact_refs) > MAX_EVENTS:
+                                self.artifact_refs.popitem(last=False)
                         self.events[key] = merge_event(self.events[key], event) if key in self.events else event
                         while len(self.events) > MAX_EVENTS:
-                            self.events.popitem(last=False)
+                            old, _ = self.events.popitem(last=False)
+                            self.artifact_refs.pop(old, None)
                 except (ValueError, TypeError, AttributeError):
                     self.skipped += 1
             if len(partial) > MAX_LINE:
@@ -112,6 +193,11 @@ class RolloutReader:
                 self.offset -= len(partial)
             if chunk:
                 self.version += 1
+            for key, event in self.events.items():
+                artifacts = [a for raw in self.artifact_refs.get(key, []) if (a := verified_reference(self.cwd, raw))]
+                if artifacts != event.get('artifacts', []):
+                    event['artifacts'] = artifacts
+                    self.version += 1
             return {"thread_id": self.thread_id, "source": self.path.name,
                     "source_updated": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
                     "version": self.version, "events": sorted(self.events.values(), key=lambda e: e['time']), "skipped": self.skipped,
