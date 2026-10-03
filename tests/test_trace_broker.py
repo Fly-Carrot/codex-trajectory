@@ -105,6 +105,21 @@ class BrokerTests(unittest.TestCase):
         self.registry.evict()
         self.assertEqual(len(self.registry.readers), 0)
 
+    def test_corrupt_index_returns_controlled_error_without_affecting_other_chat(self):
+        _, a, _ = self.registry.register(self.payload('broken'))
+        _, b, _ = self.registry.register(self.payload('working'))
+        self.registry.snapshot('broken')
+        cache = self.registry.readers['broken'][0].path
+        self.registry.readers.pop('broken')
+        cache.write_bytes(b'not a SQLite index')
+        server = self.serving()
+        with self.assertRaises(HTTPError) as err:
+            launcher.request(server.origin, '/api/threads/broken/events', a['token'])
+        self.assertEqual(err.exception.code, 503)
+        err.exception.close()
+        result = launcher.request(server.origin, '/api/threads/working/events', b['token'])
+        self.assertEqual(result['thread_id'], 'working')
+
     def test_symlink_rotation_never_reads_outside_registered_path(self):
         payload = self.payload('a')
         self.registry.register(payload)
@@ -175,8 +190,9 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(first['url'].split('#')[0], second['url'].split('#')[0])
         self.assertNotEqual(first['url'], second['url'])
         self.assertEqual(launcher.current_link(self.state, 'restart')['url'], second['url'])
-        with self.assertRaises(RuntimeError):
-            launcher.current_link(self.state, 'other')
+        renewed = launcher.current_link(self.state, 'other')
+        self.assertNotEqual(renewed['url'], other['url'])
+        self.assertEqual(renewed['thread_id'], 'other')
 
     def test_untrusted_listener_never_receives_bearer_credentials(self):
         seen = []

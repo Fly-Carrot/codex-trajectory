@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import secrets
 import signal
+import sqlite3
 import stat
 import tempfile
 import threading
@@ -18,9 +19,11 @@ import time
 from urllib.parse import urlsplit, parse_qs
 
 try:
-    from .server import Handler as BaseHandler, RolloutReader, LoopbackHTTPServer
+    from .server import Handler as BaseHandler, RolloutReader, LoopbackHTTPServer, open_regular_source
+    from .history import HistoryReader, decode_cursor
 except ImportError:
-    from server import Handler as BaseHandler, RolloutReader, LoopbackHTTPServer
+    from server import Handler as BaseHandler, RolloutReader, LoopbackHTTPServer, open_regular_source
+    from history import HistoryReader, decode_cursor
 
 THREAD = re.compile(r'[a-zA-Z0-9][a-zA-Z0-9_-]{0,100}')
 MAX_READERS = 8
@@ -76,8 +79,10 @@ def resolve_session(payload, sessions):
     log = Path(payload.get('transcript_path') or '').resolve(strict=True)
     if not log.is_file() or not log.is_relative_to(Path(sessions).resolve(strict=True)):
         raise ValueError('Transcript is outside the sessions directory')
-    with os.fdopen(os.open(log, os.O_RDONLY | os.O_NOFOLLOW), 'rb') as stream:
+    with open_regular_source(log) as stream:
         meta = json.loads(stream.readline(8 * 1024 * 1024))
+    if not isinstance(meta, dict) or not isinstance(meta.get('payload'), dict):
+        raise ValueError('Invalid source header')
     data = meta.get('payload', {})
     if meta.get('type') != 'session_meta' or data.get('id') != thread:
         raise ValueError('Transcript does not match the thread')
@@ -93,6 +98,7 @@ class Registry:
         self.clock = clock
         self.lock = threading.RLock()
         self.readers = OrderedDict()
+        self.thread_locks = {}
         self.epoch = secrets.token_hex(8)
         try:
             value = read_private(self.state / 'registry.json')
@@ -114,7 +120,19 @@ class Registry:
         thread, log = resolve_session(payload, self.sessions)
         with self.lock:
             old = self.entries.get(thread)
-            entry = {'log': str(log), 'token': old['token'] if old else secrets.token_urlsafe(32)}
+            paths = list(old.get('logs', [old['log']])) if old else []
+            if str(log) not in paths:
+                paths.append(str(log))
+            # One-time recovery of exact-ID segments from older single-log installs.
+            if not old or 'logs' not in old:
+                for candidate in self.sessions.glob('**/*'+thread+'*.jsonl'):
+                    try:
+                        _, verified = resolve_session({**payload, 'transcript_path': str(candidate)}, self.sessions)
+                        if str(verified) not in paths:
+                            paths.append(str(verified))
+                    except (OSError, ValueError, TypeError):
+                        continue
+            entry = {'log': str(log), 'logs': sorted(paths), 'token': old['token'] if old else secrets.token_urlsafe(32)}
             changed = old != entry
             if changed:
                 updated = {**self.entries, thread: entry}
@@ -136,24 +154,29 @@ class Registry:
                 if now - touched >= CACHE_TTL:
                     self.readers.pop(thread)
 
-    def snapshot(self, thread):
+    def snapshot(self, thread, before=None, detail=None, anchor=None):
         with self.lock:
             self.evict()
             entry = self.entries[thread]
             # Re-check containment on every read, including replaced parent directories.
             path = Path(entry['log'])
-            if path.resolve(strict=True) != path or not path.is_relative_to(self.sessions):
+            if path.resolve(strict=False) != path or not path.is_relative_to(self.sessions):
                 raise ValueError('Registered source path changed')
             if thread not in self.readers:
                 while len(self.readers) >= MAX_READERS:
                     self.readers.popitem(last=False)
-                self.readers[thread] = (RolloutReader(path, thread), secrets.token_hex(8), self.clock())
+                directory = private_directory(self.state / thread)
+                reader = HistoryReader(directory, self.sessions, thread, entry.get('logs', [entry['log']]))
+                reader.lock = self.thread_locks.setdefault(thread, threading.RLock())
+                self.readers[thread] = (reader, secrets.token_hex(8), self.clock())
             reader, generation, _ = self.readers[thread]
             self.readers[thread] = (reader, generation, self.clock())
             self.readers.move_to_end(thread)
-            result = reader.snapshot()
+        # File IO and indexing must not hold the cross-chat registry lock.
+        result = reader.snapshot(before=before, detail=detail, anchor=anchor)
+        if 'version' in result:
             result['version'] = self.epoch + ':' + generation + ':' + str(result['version'])
-            return result
+        return result
 
 
 class BrokerServer(LoopbackHTTPServer):
@@ -229,8 +252,22 @@ class BrokerHandler(BaseHandler):
             self.json_reply({'thread_id': thread, 'instance': self.server.instance, 'pid': os.getpid(), 'log': entry['log']})
             return
         try:
-            self.json_reply(self.server.registry.snapshot(thread))
-        except (OSError, ValueError, KeyError):
+            query = parse_qs(urlsplit(self.path).query)
+            before = query.get('before', [None])[0]
+            detail = query.get('detail', [None])[0]
+            anchor = query.get('anchor', [None])[0]
+            if before:
+                decode_cursor(before)
+            if detail and len(detail) > 1024:
+                raise ValueError('Invalid detail ID')
+            if anchor and len(anchor) > 1024:
+                raise ValueError('Invalid anchor ID')
+        except ValueError:
+            self.reply(400, b'Invalid history request')
+            return
+        try:
+            self.json_reply(self.server.registry.snapshot(thread, before=before, detail=detail, anchor=anchor))
+        except (OSError, ValueError, KeyError, sqlite3.Error):
             self.reply(503, b'Selected log unavailable; no other conversation was substituted')
 
     def do_POST(self):
@@ -275,6 +312,10 @@ def main():
         data = {'origin': server.origin, 'pid': os.getpid(), 'token': server.admin_token,
                 'instance': server.instance, 'schema': SERVICE_SCHEMA}
         write_private(connection, data)
+        # Refresh every registered chat, not only the one that started the service.
+        for thread, entry in server.registry.entries.items():
+            directory = private_directory(state / thread)
+            write_private(directory / 'connection.json', server.chat_connection(thread, entry))
         stopped = threading.Event()
 
         def cleanup_idle():

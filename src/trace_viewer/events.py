@@ -7,6 +7,11 @@ import re
 import shlex
 
 
+SECRET_NAME = r'(?:[\w-]{0,64}(?:password|secret|api[_-]?key)[\w-]{0,64}|(?:[\w-]{1,64}[_-])?token)'
+SECRET_KEY = re.compile(SECRET_NAME, re.I)
+SECRET_ASSIGNMENT = re.compile(r'\b' + SECRET_NAME + r'''(?:\\*["'])?\s*[:=]\s*''', re.I)
+
+
 def public_text(value):
     if isinstance(value, list):
         return "\n".join(filter(None, (public_text(v) for v in value)))
@@ -17,23 +22,113 @@ def public_text(value):
     return value if isinstance(value, str) else ""
 
 
-def redact(text):
-    text = re.sub(r"(?i)\b(Bearer)\s+[A-Za-z0-9._~+/=-]+", r"\1 [redacted]", str(text))
+def credential_end(text, start):
+    end, delimiter = start, ''
+    # Adjacent quoted/unquoted shell pieces belong to the same credential.
+    while end < len(text) and not (text[end].isspace() or text[end] in ',;}]&|<>'):
+        quote_at = end
+        while quote_at < len(text) and text[quote_at] == '\\':
+            quote_at += 1
+        if quote_at < len(text) and text[quote_at] in ('"', "'"):
+            if end == start:
+                delimiter = text[end:quote_at + 1]
+            escapes = quote_at - end
+            slashes = 0
+            for index in range(quote_at + 1, len(text)):
+                char = text[index]
+                # JSON escaping doubles backslashes at each nesting level.
+                literal_single_quote = text[quote_at] == "'" and escapes == 0
+                if char == text[quote_at] and (literal_single_quote or slashes % (2 * (escapes + 1)) == escapes):
+                    end = index + 1
+                    break
+                slashes = slashes + 1 if char == '\\' else 0
+            else:
+                return len(text), delimiter
+        elif text.startswith('[redacted]', end):
+            end += len('[redacted]')
+        elif text[end] in '[{':
+            # An incomplete JSON credential container has no safe boundary.
+            return len(text), delimiter
+        else:
+            while end < len(text) and not (text[end].isspace() or text[end] in '\"\',;}]&|<>'):
+                end += 2 if text[end] == '\\' and end + 1 < len(text) else 1
+    return end, delimiter
+
+
+def redact_text(text):
+    text = re.sub(r"(?i)\b(Bearer)\s+[A-Za-z0-9._~+/=-]+", r"\1 [redacted]", text)
     text = re.sub(r"\b(?:sk-|ghp_|gho_|github_pat_|nvapi-)[A-Za-z0-9_-]{8,}", "[redacted]", text)
     text = re.sub(r"(http://127\.0\.0\.1:\d+/[^\s#]*#)[A-Za-z0-9_-]+", r"\1[redacted]", text)
-    text = re.sub(r'''(?i)((?:[\w-]*(?:password|secret|api[_-]?key)[\w-]*|(?:[\w-]+[_-])?token)["']?\s*[:=]\s*["']?)[^\s"',;}]+''', r"\1[redacted]", text)
+    parts, end = [], 0
+    for match in SECRET_ASSIGNMENT.finditer(text):
+        if match.start() < end:
+            continue
+        parts.append(text[end:match.end()])
+        end, delimiter = credential_end(text, match.end())
+        parts.append(delimiter + '[redacted]' + delimiter)
+    text = ''.join(parts) + text[end:]
     text = re.sub(r"/Users/[^/\s]+", "~", text)
-    return text[:2400] + ("\n[preview truncated]" if len(text) > 2400 else "")
+    return text
+
+
+def redact_structure(value, depth=0):
+    # Called only on already selected public fields, never on a whole event.
+    if depth > 16:
+        return '[preview truncated]'
+    if isinstance(value, dict):
+        return {redact(str(key)): '[redacted]' if SECRET_KEY.fullmatch(str(key))
+                else redact_structure(item, depth + 1) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact_structure(item, depth + 1) for item in value]
+    return redact(value) if isinstance(value, str) else value
+
+
+def redact(text):
+    text = str(text)
+    oversized = len(text) > 8192
+    # Bound parsing and regex input before scanning binary-like text.
+    text = text[:8192]
+    structured = None
+    if text.lstrip().startswith(('{', '[')):
+        try:
+            structured = json.loads(text)
+        except (ValueError, RecursionError):
+            pass
+    if isinstance(structured, (dict, list)):
+        text = json.dumps(redact_structure(structured), ensure_ascii=False, separators=(',', ':'))
+    else:
+        text = redact_text(text)
+    return text[:2400] + ("\n[preview truncated]" if oversized or len(text) > 2400 else "")
 
 
 def preview(value):
     if value is None:
         return ""
-    return redact(value if isinstance(value, str) else json.dumps(value, ensure_ascii=False))
+    if isinstance(value, str):
+        return redact(value)
+    text = json.dumps(redact_structure(value), ensure_ascii=False)
+    return text[:2400] + ("\n[preview truncated]" if len(text) > 2400 else "")
 
 
 def number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def tool_badges(item, command=None):
+    badges = []
+    plugin = item.get('plugin_name')
+    if isinstance(plugin, str) and re.fullmatch(r'[\w .@/-]{1,80}', plugin):
+        badges.append('Plugin: ' + redact(plugin))
+    if command and type(item.get('exit_code')) is int and item['exit_code'] == 0:
+        try:
+            args = shlex.split(command)
+        except ValueError:
+            args = []
+        if len(args) == 2 and args[0] in ('cat', '/bin/cat') and not re.search(r'[;|&<>`$\n]', command):
+            match = re.search(r'/skills/(?:\.system/)?([^/]+)/SKILL\.md$', args[1])
+            if match:
+                badges.append('Skill: ' + redact(match[1]) + ' (loaded)')
+    return badges
 
 
 def normalize(record, offset):
@@ -52,7 +147,8 @@ def normalize(record, offset):
             if role == "user":
                 event.update(lane="input", category="USER", title="User")
             elif role == "assistant" and phase in ("commentary", "final", "final_answer"):
-                event["title"] = "Assistant" if phase == "commentary" else "Final response"
+                event["title"] = "Agent progress" if phase == "commentary" else "Final response"
+                event['reply_phase'] = 'Progress' if phase == 'commentary' else 'Final'
             else:
                 return None
             event["id"] = "item:" + str(p["id"]) if p.get("id") else event["id"]
@@ -70,6 +166,8 @@ def normalize(record, offset):
             event["detail"] = event[field]
             if result:
                 event['output_time'] = event['time']
+            elif p.get('name') in ('exec', 'functions.exec'):
+                event['is_wrapper'] = True
         else:
             return None
         return event
@@ -94,8 +192,9 @@ def normalize(record, offset):
     if t in ("AgentMessage", "agentMessage"):
         if item.get("phase") not in ("commentary", "final_answer", "final"):
             return None
-        event.update(title="Assistant" if item["phase"] == "commentary" else "Final response",
+        event.update(title="Agent progress" if item["phase"] == "commentary" else "Final response",
                      detail=redact(public_text(item.get("content", item.get("text", "")))))
+        event['reply_phase'] = 'Progress' if item['phase'] == 'commentary' else 'Final'
     elif t in ("CommandExecution", "commandExecution"):
         command = item.get('command', 'Command')
         display = command
@@ -110,6 +209,7 @@ def normalize(record, offset):
             event["exit_code"] = item["exit_code"]
             if item["exit_code"] != 0:
                 event["state"] = "failed"
+        event['badges'] = tool_badges(item, display if isinstance(display, str) else None)
     elif t in ("FileChange", "fileChange"):
         changes = item.get("changes", {})
         if isinstance(changes, dict):
@@ -127,6 +227,7 @@ def normalize(record, offset):
                      input=preview(item.get("arguments")), output=redact(output))
         if isinstance(result, dict) and result.get("isError"):
             event["state"] = "failed"
+        event['badges'] = tool_badges(item)
     elif t in ("CollabAgentToolCall", "collabToolCall"):
         event.update(lane="tools", category="AGENT", title=redact(item.get("tool", "Agent operation")),
                      input=preview(item.get("prompt")),
@@ -136,8 +237,17 @@ def normalize(record, offset):
                      detail="Context compaction recorded. Internal context is not displayed.")
     elif t in ("Plan", "plan"):
         event.update(category="PLAN", title="Plan update", detail=redact(public_text(item.get("text", ""))))
-    elif t in ("WebSearch", "webSearch"):
-        event.update(lane="tools", category="SEARCH", title="Web search", input=preview(item.get("query")))
+    elif t in ("WebSearch", "webSearch") or (t == "Extension" and item.get("kind") == "web.search"):
+        # Accept host-native search only, not browser commands or arbitrary extensions.
+        action = item.get("action") if isinstance(item.get("action"), dict) else {}
+        results = item.get("results")
+        public_results = [
+            {key: result[key] for key in ("title", "url", "snippet") if isinstance(result.get(key), str)}
+            for result in results[:10] if isinstance(result, dict) and result.get("type") == "text_result"
+        ] if isinstance(results, list) else []
+        event.update(lane="tools", category="SEARCH", title="Web search",
+                     input=preview(item.get("query") or action.get("query") or action.get("queries")),
+                     output=preview(public_results) if public_results else "")
     else:
         return None
     item_id = str(item.get("id") or "")

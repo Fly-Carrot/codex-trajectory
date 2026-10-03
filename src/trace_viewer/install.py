@@ -13,7 +13,7 @@ import tempfile
 
 BEGIN = '<!-- CODEX-TRAJECTORY:BEGIN -->'
 END = '<!-- CODEX-TRAJECTORY:END -->'
-FILES = ('events.py', 'server.py', 'broker.py', 'launcher.py', 'index.html', 'install.py')
+FILES = ('events.py', 'server.py', 'history.py', 'broker.py', 'launcher.py', 'index.html', 'install.py')
 
 
 def atomic(path, data):
@@ -87,11 +87,21 @@ def configure(home, dry_run=False, uninstall=False):
             + shlex.join([sys.executable, str(wrapper)]) + ' --url --thread-id "$CODEX_THREAD_ID"`. '
             'Never guess a chat or URL, expose the link in public artifacts, open tabs automatically, '
             'or interrupt normal work if the observer is unavailable.\n' + END)
+    original_rules = previous.get('original_rules', rules)
+    outside_rules = previous.get('original_outside_rules')
+    # Legacy manifests only saved the initial prose and the latest full snapshot.
+    # Reconstruct the initial separator bytes, never trust a reinstalled snapshot.
+    if outside_rules is None and BEGIN not in original_rules and END not in original_rules:
+        outside_rules = [original_rules + ('\n\n' if original_rules else ''), '\n']
+    if not uninstall and BEGIN not in rules:
+        original_rules = rules
+        outside_rules = [rules + ('\n\n' if rules else ''), '\n']
     if uninstall:
         new_rules = base_rules
-        # Restore byte-identical pre-install prose when nobody edited around it.
-        if previous.get('installed_rules') == rules:
-            new_rules = previous.get('original_rules', base_rules)
+        # Edits within our block do not authorize reverting edits outside it.
+        surrounds = [rules[:rules.index(BEGIN)], rules[rules.index(END) + len(END):]] if BEGIN in rules else None
+        if surrounds is not None and surrounds == outside_rules:
+            new_rules = original_rules
     elif BEGIN in rules:
         new_rules = rules[:rules.index(BEGIN)] + rule + rules[rules.index(END)+len(END):]
     else:
@@ -132,7 +142,8 @@ def configure(home, dry_run=False, uninstall=False):
         atomic(paths[0], (json.dumps(updated, indent=2)+'\n').encode())
         atomic(paths[1], new_rules.encode())
         atomic(manifest_path, json.dumps({'hook_command': command, 'installed_rules': new_rules,
-               'original_rules': previous.get('original_rules', rules), 'uninstalled': uninstall}).encode())
+               'original_rules': original_rules, 'original_outside_rules': outside_rules,
+               'uninstalled': uninstall}).encode())
     return result
 
 
