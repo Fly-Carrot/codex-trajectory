@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer">
 <title>codex-trajectory</title>
 <style>
 :root{color-scheme:dark;--bg:#1c1c1c;--panel:#242424;--line:#ffffff12;--text:#d0d0d0;--muted:#848484;--blue:#6998df;--green:#51a67b;--purple:#a182bd;--orange:#df912c;--font:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei","Helvetica Neue",Helvetica,Arial,sans-serif;--mono:"SF Mono","JetBrains Mono","Fira Code",Consolas,"Liberation Mono",Menlo,monospace}
@@ -18,6 +18,7 @@
 <header><span class="brand">codex-trajectory</span><span class="tab">Trajectory</span><span class="thread" id="thread"></span><span class="status" id="status">Connecting</span></header>
 <div class="toolbar"><select id="scale" aria-label="Timeline scale"><option value="events">Event order</option><option value="time">Clock time</option></select><button id="zoom-out" aria-label="Zoom out">−</button><button id="zoom-in" aria-label="Zoom in">+</button><button id="earlier" hidden>Load earlier</button><button id="latest">Latest</button><span id="history-note" class="history-note" role="status"></span><span class="spacer"></span><input class="search" id="search" placeholder="Search" aria-label="Search events"><button id="follow" aria-pressed="true">Follow</button><button id="pause" aria-pressed="false">Pause</button></div>
 <div id="warnings" role="status" hidden style="flex:none;padding:6px 12px;color:#dfb476;background:#392f21;max-height:80px;overflow:auto;white-space:pre-wrap"></div>
+<div id="recovery" role="status" hidden style="flex:none;padding:8px 12px;color:#dfb476;background:#392f21">Open the latest Trajectory link in this chat. If the service restarted, send a message in this chat to refresh the link. Your saved logs have not been deleted. Keep access links private.</div>
 <div class="timeline"><div class="labels" id="lane-labels" aria-label="Event categories"></div><div class="viewport" id="timeline-scroll" tabindex="0" aria-label="Timeline. Drag or scroll to pan; Control plus wheel to zoom."><div id="track"></div></div></div>
 <div class="content"><main class="ledger" id="events" aria-label="Event ledger"><div class="empty">Connecting to this conversation…</div></main><aside id="inspector" hidden aria-label="Selected event"><div class="inspect-head"><strong id="inspect-title"></strong><button id="close" aria-label="Close details">×</button></div><div class="inspect-meta" id="inspect-meta"></div><pre id="inspect-body"></pre></aside></div>
 <footer><span id="count">0</span><span>records</span><span id="calls">0</span><span>operations</span><span id="returns">0</span><span>closed</span><span class="spacer"></span><span id="updated"></span><button id="wrappers" aria-pressed="false" title="Show folded wrapper result rows">Wrapper results</button><button id="about">Info</button></footer>
@@ -28,7 +29,10 @@ const $=id=>document.getElementById(id);
 const threadPath=location.pathname.match(/^\/t\/([a-zA-Z0-9][a-zA-Z0-9_-]{0,100})$/),tokenKey='trace-token:'+location.pathname;
 let token=location.hash.slice(1);
 try{token=token||sessionStorage.getItem(tokenKey)||'';if(token)sessionStorage.setItem(tokenKey,token)}catch{}
-if(token)history.replaceState(null,'',location.pathname);
+// Keep the private fragment in the restored tab URL; sessionStorage may vanish on app exit.
+// Upgrade older hash-free tabs while their session credential is still available.
+if(token&&!location.hash)history.replaceState(null,'',location.pathname+'#'+token);
+window.addEventListener('hashchange',()=>{if(location.hash&&location.hash.slice(1)!==token)location.reload()});
 const endpoint=threadPath?'/api/threads/'+threadPath[1]:'/api';
 let canonicalEvents=[],showWrappers=false;
 let events=[],version=-1,selected=null,follow=true,ledgerFollow=true,paused=false,zoom=1,drag=null,moved=false;
@@ -67,9 +71,16 @@ function historyControls(){
  $('latest').disabled=loadingPage||reconnect;
  $('history-note').textContent=indexing?'Indexing history…':windowFull?'Browsing a bounded history window':historyHeld?'Browsing history':'';
 }
-function reportError(error){$('status').textContent=reconnect?'Reconnect required':error.message;$('status').classList.add('error');historyControls()}
+function reportError(error){
+ $('status').textContent=reconnect?'Reconnect required':error.message;$('status').classList.add('error');
+ const help=$('recovery');if(help){help.hidden=false;help.textContent=reconnect?
+  (token?'This access link has expired. ':'This tab is missing its access link. ')+
+  'Open the latest Trajectory link in this chat. If the service restarted, send a message in this chat to refresh the link. Keep access links private.':
+  'Could not load the local viewer. Retrying automatically. If it stays unavailable, send a message in this chat to restart the viewer. Saved logs are not deleted by a connection failure.'}
+ historyControls();
+}
 async function requestEvents(query=''){
- if(!token)throw Error('Access link required');
+ if(!token){reconnect=true;throw Error('Access link required')}
  const r=await fetch(endpoint+'/events'+query,{headers:{Authorization:'Bearer '+token},cache:'no-store',signal:AbortSignal.timeout(7000)});
  if(!r.ok){if(r.status===401){reconnect=true;throw Error('Reconnect required')}throw Error('Log unavailable ('+r.status+')')}
  return r.json();
@@ -122,7 +133,7 @@ async function latest(){
  if(loadingPage||reconnect)return;
  loadingPage=true;const epoch=++generation;historyControls();
  try{const data=await requestEvents();if(epoch!==generation||reconnect)return;
-  warningMessages.clear();warningsOverflow=false;acceptWarnings(data);$('status').textContent=liveStatus();$('status').classList.remove('error');
+  warningMessages.clear();warningsOverflow=false;acceptWarnings(data);$('status').textContent=liveStatus();$('status').classList.remove('error');$('recovery').hidden=true;
   canonicalEvents=[];eventPages.clear();selected=null;detailEvent=null;detailId=null;detailRequest++;$('inspector').hidden=true;
   detailRevision=null;pendingDetails=false;
   browsingCursor=null;historyHeld=false;windowFull=false;restoring=false;ledgerFollow=true;setFollow(true);$('search').value='';
@@ -305,9 +316,9 @@ async function poll(){
    if(document.hidden)return;
    if(cursor){data=await requestEvents();if(epoch!==generation||reconnect)return;acceptWarnings(data)}
    mergePage(data.events||[],'latest');pageMetadata(data);indexing=true;refreshEvents();
-   $('status').textContent=liveStatus();$('status').classList.remove('error');return;
+   $('status').textContent=liveStatus();$('status').classList.remove('error');$('recovery').hidden=true;return;
   }
-  $('status').textContent=liveStatus();$('status').classList.remove('error');
+  $('status').textContent=liveStatus();$('status').classList.remove('error');$('recovery').hidden=true;
   $('thread').textContent=(data.thread_id||'').slice(0,8);$('thread').title=data.thread_id||'';
   $('updated').textContent=clock(data.source_updated);$('updated').title=data.skipped?data.skipped+' malformed or oversized records skipped':'Latest source update';
   indexing=!!data.indexing;

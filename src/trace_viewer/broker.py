@@ -1,6 +1,7 @@
 """One private loopback observer; independent authorization and lazy cache per chat."""
 
 import argparse
+import errno
 from collections import OrderedDict
 import fcntl
 import hashlib
@@ -28,6 +29,8 @@ except ImportError:
 THREAD = re.compile(r'[a-zA-Z0-9][a-zA-Z0-9_-]{0,100}')
 MAX_READERS = 8
 CACHE_TTL = 120
+DISK_BUDGET = 512 * 1024 * 1024
+INDEX_GROWTH = 16 * 1024 * 1024
 SERVICE_SCHEMA = 1
 
 
@@ -93,12 +96,14 @@ def resolve_session(payload, sessions):
 
 class Registry:
     def __init__(self, state, sessions, clock=time.monotonic):
-        self.state = private_directory(state)
+        self.state = private_directory(state).resolve()
         self.sessions = Path(sessions).resolve(strict=True)
         self.clock = clock
         self.lock = threading.RLock()
         self.readers = OrderedDict()
         self.thread_locks = {}
+        self.busy = {}
+        self.reservations = {}
         self.epoch = secrets.token_hex(8)
         try:
             value = read_private(self.state / 'registry.json')
@@ -151,12 +156,66 @@ class Registry:
         with self.lock:
             now = self.clock()
             for thread, (_, _, touched) in list(self.readers.items()):
-                if now - touched >= CACHE_TTL:
+                if now - touched >= CACHE_TTL and not self.busy.get(thread):
                     self.readers.pop(thread)
+            self.prune_indexes(DISK_BUDGET)
+
+    def cache_files(self):
+        files = {}
+        for thread in self.entries:
+            if not THREAD.fullmatch(thread):
+                continue
+            directory = self.state / thread
+            if directory.is_symlink() or directory.resolve() != directory:
+                continue
+            path = directory / 'history.sqlite3'
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                continue
+            if stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and info.st_nlink == 1:
+                files[thread] = (path, info.st_size, info.st_mtime)
+        return files
+
+    def prune_indexes(self, target):
+        # Called under the registry lock. Never delete a live/in-flight reader,
+        # raw transcript, connection file, or registration, only rebuildable DBs.
+        files = self.cache_files()
+        total = sum(item[1] for item in files.values())
+        for thread, (path, size, _) in sorted(files.items(), key=lambda item: item[1][2]):
+            if total <= target:
+                break
+            if thread in self.readers or self.busy.get(thread):
+                continue
+            sidecars = [Path(str(path)+suffix) for suffix in ('-journal', '-wal', '-shm')]
+            if any(p.is_symlink() for p in sidecars):
+                continue
+            try:
+                path.unlink()
+                for extra in sidecars:
+                    extra.unlink(missing_ok=True)
+                total -= size
+            except OSError:
+                continue
+        return total
+
+    def reserve_index(self, thread, growth=INDEX_GROWTH):
+        self.prune_indexes(max(0, DISK_BUDGET - growth))
+        files = self.cache_files()
+        used = sum(item[1] for item in files.values())
+        reserved = sum(max(0, limit-files.get(key, (None, 0, 0))[1])
+                       for key, limit in self.reservations.items())
+        current = files.get(thread, (None, 0, 0))[1]
+        limit = current + min(growth, max(0, DISK_BUDGET-used-reserved))
+        self.reservations[thread] = limit
+        return limit
 
     def snapshot(self, thread, before=None, detail=None, anchor=None):
         with self.lock:
             self.evict()
+            # Reclaim before pinning the requested chat, so reopening a formerly
+            # full, idle index can rebuild it instead of staying permanently full.
+            self.prune_indexes(max(0, DISK_BUDGET - INDEX_GROWTH))
             entry = self.entries[thread]
             # Re-check containment on every read, including replaced parent directories.
             path = Path(entry['log'])
@@ -172,8 +231,28 @@ class Registry:
             reader, generation, _ = self.readers[thread]
             self.readers[thread] = (reader, generation, self.clock())
             self.readers.move_to_end(thread)
+            self.busy[thread] = self.busy.get(thread, 0) + 1
         # File IO and indexing must not hold the cross-chat registry lock.
-        result = reader.snapshot(before=before, detail=detail, anchor=anchor)
+        try:
+            with reader.lock:
+                with self.lock:
+                    growth = INDEX_GROWTH
+                    if reader.capacity_limit_hit is not None:
+                        growth = max(growth, reader.capacity_limit_hit-reader.path.stat().st_size+INDEX_GROWTH)
+                    reader.disk_limit_bytes = self.reserve_index(thread, growth)
+                try:
+                    result = reader.snapshot(before=before, detail=detail, anchor=anchor)
+                finally:
+                    with self.lock:
+                        self.reservations.pop(thread, None)
+                # Persist LRU usage without copying conversation contents.
+                if not reader.path.is_symlink():
+                    os.utime(reader.path, None)
+        finally:
+            with self.lock:
+                self.busy[thread] -= 1
+                if not self.busy[thread]:
+                    del self.busy[thread]
         if 'version' in result:
             result['version'] = self.epoch + ':' + generation + ':' + str(result['version'])
         return result
@@ -306,7 +385,14 @@ def main():
                 raise ValueError('Invalid saved port')
         except FileNotFoundError:
             port = 0
-        server = BrokerServer(Registry(state, args.sessions), port)
+        registry = Registry(state, args.sessions)
+        try:
+            server = BrokerServer(registry, port)
+        except OSError as exc:
+            if not port or exc.errno != errno.EADDRINUSE:
+                raise
+            # Never stop or send credentials to the occupant of a saved port.
+            server = BrokerServer(registry, 0)
         write_private(state / 'endpoint.json', {'port': server.server_port})
         connection = state / 'service.json'
         data = {'origin': server.origin, 'pid': os.getpid(), 'token': server.admin_token,
@@ -321,9 +407,6 @@ def main():
         def cleanup_idle():
             while not stopped.wait(15):
                 server.registry.evict()
-                if time.monotonic() - server.last_access > 3600:
-                    server.shutdown()
-                    return
 
         threading.Thread(target=cleanup_idle, daemon=True).start()
 

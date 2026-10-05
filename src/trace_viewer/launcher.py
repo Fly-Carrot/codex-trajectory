@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import stat
 import subprocess
 import sys
 import threading
@@ -47,7 +48,12 @@ def request(origin, path, token, payload=None):
 
 def service_identity(data):
     nonce = secrets.token_hex(32)
-    proof = request(data['origin'], '/api/identity?nonce='+nonce, '')
+    try:
+        proof = request(data['origin'], '/api/identity?nonce='+nonce, '')
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    if not isinstance(proof, dict):
+        return False
     expected = hmac.new(data['token'].encode(), nonce.encode(), hashlib.sha256).hexdigest()
     return proof.get('instance') == data['instance'] and hmac.compare_digest(str(proof.get('proof', '')), expected)
 
@@ -149,9 +155,56 @@ def launch(payload, state=DEFAULT_STATE, sessions=None, auto_open=False, opener=
                 'opened': opened, 'connection_file': str(connection), 'pid': data['pid'], 'url': data['url']}
 
 
-def current_link(state, thread):
-    if not thread or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_-]{0,100}', thread):
+def validate_thread(thread):
+    if not isinstance(thread, str) or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_-]{0,100}', thread):
         raise ValueError('An exact thread ID is required')
+
+
+def resume(state, thread, sessions=None):
+    validate_thread(thread)
+    state = Path(state)
+    sessions = Path(sessions or Path(os.environ.get('CODEX_HOME', Path.home() / '.codex')) / 'sessions').resolve(strict=True)
+
+    def check_directory(path):
+        info = path.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise ValueError('Unsafe private state directory')
+
+    check_directory(state)
+    try:
+        registry = read_private(state / 'registry.json')
+    except FileNotFoundError:
+        # Legacy connection is a source pointer, never evidence of a live URL.
+        check_directory(state / thread)
+        entry = read_private(state / thread / 'connection.json')
+        if not isinstance(entry, dict) or entry.get('thread_id') != thread:
+            raise ValueError('Connection does not match the thread')
+    else:
+        if (not isinstance(registry, dict) or registry.get('schema') != SERVICE_SCHEMA
+                or registry.get('sessions_root') != str(sessions)
+                or not isinstance(registry.get('threads'), dict)):
+            raise ValueError('Invalid registry')
+        for key, value in registry['threads'].items():
+            validate_thread(key)
+            if (not isinstance(value, dict) or not isinstance(value.get('log'), str)
+                    or not value['log'] or not isinstance(value.get('token'), str)
+                    or not value['token'] or not isinstance(value.get('logs', []), list)
+                    or any(not isinstance(path, str) or not path for path in value.get('logs', []))):
+                raise ValueError('Malformed registry entry')
+        entry = registry['threads'].get(thread)
+    if not isinstance(entry, dict) or not isinstance(entry.get('log'), str) or not entry['log']:
+        raise ValueError('No registered source for this exact thread')
+    payload = {'hook_event_name': 'UserPromptSubmit', 'session_id': thread,
+               'transcript_path': entry['log']}
+    resolve_session(payload, sessions)
+    result = launch(payload, state=state, sessions=sessions, auto_open=False)
+    if not result.get('url'):
+        raise RuntimeError('Resume did not produce a verified link; retry after the active launch')
+    return result
+
+
+def current_link(state, thread):
+    validate_thread(thread)
     data = healthy(Path(state) / thread / 'connection.json', thread)
     if not data:
         raise RuntimeError('No verified live link for this thread. Register this exact transcript first.')
@@ -174,15 +227,24 @@ def main():
     parser.add_argument('--hook', action='store_true')
     parser.add_argument('--auto-open', action='store_true')
     parser.add_argument('--url', action='store_true', help='Return a verified existing link; do not start or scan logs')
+    parser.add_argument('--resume', action='store_true', help='Recover an exact registered thread without opening a tab')
     parser.add_argument('--state-dir', type=Path, default=DEFAULT_STATE)
     parser.add_argument('--log', type=Path)
     parser.add_argument('--thread-id')
     args = parser.parse_args()
+    if sum((args.hook, args.url, args.resume)) > 1:
+        parser.error('--hook, --url and --resume are mutually exclusive')
+    if (args.url or args.resume) and (args.auto_open or args.log is not None):
+        parser.error('--url and --resume cannot be combined with --auto-open or --log')
+    if (args.url or args.resume) and not args.thread_id:
+        parser.error('--url and --resume require --thread-id')
+    if args.hook and (args.log is not None or args.thread_id is not None):
+        parser.error('--hook cannot be combined with --log or --thread-id')
     try:
         if args.url:
-            if args.hook:
-                raise ValueError('--url cannot be combined with --hook')
             result = current_link(args.state_dir, args.thread_id)
+        elif args.resume:
+            result = resume(args.state_dir, args.thread_id)
         else:
             payload = json.loads(sys.stdin.read(1024 * 1024)) if args.hook else {
                 'hook_event_name': 'UserPromptSubmit', 'session_id': args.thread_id,
@@ -194,7 +256,7 @@ def main():
             print(json.dumps({'suppressOutput': True}))
             print('Trace viewer skipped: ' + type(exc).__name__, file=sys.stderr)
         else:
-            parser.exit(1, 'Trajectory unavailable: ' + str(exc) + '\n')
+            parser.exit(1, 'Trajectory unavailable: ' + type(exc).__name__ + '\n')
 
 
 if __name__ == '__main__':

@@ -7,6 +7,7 @@ from pathlib import Path
 import sqlite3
 import stat
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -68,6 +69,9 @@ class HistoryReader:
         finally:
             os.close(fd)
         self.initialized = False
+        self.disk_limit_bytes = None
+        self.capacity_limit_hit = None
+        self.capacity_retry_at = 0
 
     def initialize(self):
         if self.initialized:
@@ -103,6 +107,9 @@ class HistoryReader:
             db.row_factory = sqlite3.Row
             db.execute('PRAGMA cache_size=-2048')
             db.execute('PRAGMA mmap_size=0')
+            if self.disk_limit_bytes is not None:
+                page_size = db.execute('PRAGMA page_size').fetchone()[0]
+                db.execute(f'PRAGMA max_page_count={max(1, self.disk_limit_bytes // page_size)}')
             with db:
                 yield db
         finally:
@@ -249,17 +256,38 @@ class HistoryReader:
 
     def snapshot(self, before=None, detail=None, anchor=None):
         with self.lock:
+            if self.disk_limit_bytes is not None and self.disk_limit_bytes < 32768 and self.path.stat().st_size == 0:
+                return {'thread_id': self.thread, 'events': [], 'version': 'capacity',
+                        'indexing': True, 'has_earlier': True, 'next_cursor': None,
+                        'warnings': ['Index cache capacity reached. Close unused viewers to free rebuildable indexes; source logs are unchanged.']}
             self.initialize()
-            return self._snapshot(before, detail, anchor)
+            if (self.capacity_limit_hit is not None and self.disk_limit_bytes is not None
+                    and self.disk_limit_bytes <= self.capacity_limit_hit
+                    and time.monotonic() < self.capacity_retry_at):
+                return self._snapshot(before, detail, anchor, capacity_limited=True)
+            try:
+                result = self._snapshot(before, detail, anchor)
+                self.capacity_limit_hit = None
+                return result
+            except sqlite3.OperationalError as exc:
+                # Python 3.10 lacks sqlite_errorcode; keep its exact FULL message fallback.
+                if (getattr(exc, 'sqlite_errorcode', None) != 13
+                        and str(exc) != 'database or disk is full'):
+                    raise
+                self.capacity_limit_hit = self.disk_limit_bytes
+                self.capacity_retry_at = time.monotonic() + 60
+                # The failed transaction rolls back; keep serving the last safe
+                # snapshot rather than deleting active history or growing forever.
+                return self._snapshot(before, detail, anchor, capacity_limited=True)
 
-    def _snapshot(self, before=None, detail=None, anchor=None):
+    def _snapshot(self, before=None, detail=None, anchor=None, capacity_limited=False):
         boundary = decode_cursor(before) if before else None
         with self.connect() as db:
             if detail:
                 return {'event': self.full_event(db, detail)}
             if not any(Path(path).exists() for path in self.paths):
                 raise FileNotFoundError('All registered source segments are unavailable')
-            warnings = []
+            warnings = ['Index cache capacity reached. New indexing is paused; close unused viewers to free cache. Source logs are unchanged.'] if capacity_limited else []
             changed = False
             # Reserve one of eight chunks for backfill; rotate forward sources fairly.
             position = db.execute("SELECT value FROM metadata WHERE key='source_position'").fetchone()
@@ -267,9 +295,10 @@ class HistoryReader:
             paths = self.paths[::-1]
             count = min(7, len(paths))
             scheduled = [paths[(position+i) % len(paths)] for i in range(count)]
-            db.execute("INSERT OR REPLACE INTO metadata VALUES('source_position',?)",
-                       ((position+count) % max(1, len(paths)),))
-            for path in scheduled:
+            if not capacity_limited:
+                db.execute("INSERT OR REPLACE INTO metadata VALUES('source_position',?)",
+                           ((position+count) % max(1, len(paths)),))
+            for path in ([] if capacity_limited else scheduled):
                 try:
                     changed = self.ingest(db, path) or changed
                 except FileNotFoundError:
@@ -277,7 +306,7 @@ class HistoryReader:
             indexed = db.execute('SELECT * FROM sources ORDER BY path').fetchall()
             # Backfill one bounded historical chunk only while a page is open.
             # Paging is marked indexing until all earlier ranges are indexed.
-            for source in reversed(indexed):
+            for source in ([] if capacity_limited else reversed(indexed)):
                 if source['start'] > 0:
                     try:
                         changed = self.ingest(db, source['path'], backward=True) or changed
