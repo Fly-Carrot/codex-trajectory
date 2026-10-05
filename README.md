@@ -34,7 +34,7 @@ No API key. No KnowledgeOS dependency.
 ## Quick start
 
 Requires **Python 3.10+**, macOS or Linux, and a local Codex client that writes
-supported rollout logs. Windows is not supported in v0.1 (POSIX file locking).
+supported rollout logs. Windows is not supported (POSIX file locking).
 Node is only used by JavaScript regression tests, not by the viewer.
 
 ```sh
@@ -53,6 +53,11 @@ Re-running installation is idempotent.
 
 Installation does not terminate an already-running observer. Updated runtime
 files take effect on its next start; retrieve a fresh verified link then.
+
+To update an existing checkout, run `git pull --ff-only` followed by
+`python3 install.py --dry-run` and `python3 install.py`. This preserves private
+history indexes and unrelated hooks/rules. A computer restart also stops the old
+listener; the next trusted hook invocation or `--resume` starts the updated copy.
 
 **Review and trust the new hook in Codex `/hooks`.** Installation does not trust
 it for you. Resume/start a conversation after reviewing it if the current client
@@ -75,6 +80,24 @@ hook trust and use the verified-link command below; do not guess a URL.
 python3 ~/.codex/codex-trajectory/codex-trajectory --url --thread-id THREAD_ID
 ```
 
+If the service stopped, recover an already registered chat with:
+
+```sh
+python3 ~/.codex/codex-trajectory/codex-trajectory --resume --thread-id THREAD_ID
+```
+
+`--url` only checks an existing connection; `--resume` can start the listener and
+returns a verified private link. Neither command opens a tab automatically.
+Closing/reopening the client keeps the independent listener and disk index.
+After an OS reboot or a service restart, send a message to trigger the trusted
+hook, or run `--resume`. Keep the full private link, including its `#` fragment;
+it allows page restoration without depending on temporary browser storage.
+
+The listener prefers its saved port. If another program occupies it, a free port
+is selected and connection records are refreshed. Open the newly returned link:
+an old address cannot redirect itself from another program. A real listener
+restart also rotates chat credentials, even when the port is unchanged.
+
 To use a non-default Codex home: `python3 install.py --codex-home /your/codex-home`.
 The installer never enables feature flags, bypasses hook trust, or changes sandbox
 permissions. Honor your host's own approval policy.
@@ -86,8 +109,9 @@ python3 install.py --uninstall
 ```
 
 This removes only the owned hook and rule block, preserving unrelated edits.
-Runtime, private backups and state are retained for recovery. A running observer
-exits after its normal idle timeout; closing the page stops active log polling.
+Runtime, private backups and state are retained for recovery. Closing the page
+stops active log polling. The shared listener remains running until explicitly
+stopped or the computer shuts down; uninstalling the hook does not terminate it.
 The installed copy can also uninstall itself:
 `python3 ~/.codex/codex-trajectory/app/install.py --uninstall`.
 
@@ -153,7 +177,7 @@ Codex UserPromptSubmit hook
 The observer reads local JSONL transcripts, not an App Server writer connection.
 It polls at 1.5 seconds while visible. Hidden tabs use a lightweight 30-second
 status check without reading logs. At most eight readers are cached; idle caches
-expire after two minutes. An unused service exits after one hour. The embedded
+expire after two minutes. The lightweight listener stays available when idle. The embedded
 SQLite index uses Python's standard library, not another database service.
 Each source starts near its last 2 MiB; older ranges are indexed incrementally.
 At most eight source chunks are processed per request. Chat readers use separate
@@ -169,8 +193,13 @@ content and private URLs are not stored in that view-position record.
 
 Only bounded public summaries and source offsets/hashes are indexed. Original
 Codex logs remain read-only and are never automatically deleted. The disk index
-persists across service restarts and grows with observed history; this version has
-no automatic disk-quota cleanup. It is a cache, not an independent archive: full
+persists across service restarts. Main SQLite indexes share a **512 MiB budget**;
+least-recently-used inactive indexes are removed automatically and can be rebuilt.
+If active readers occupy the budget, new indexing pauses with a visible warning
+while the last safe index remains readable. Close unused viewers to release their
+readers after the idle interval. This is not a total-folder cap: original logs,
+temporary SQLite journals, installation backups and memory are outside it.
+It is a cache, not an independent archive: full
 details still need the source log. Unsupported or oversized source records may be
 omitted and are reported in coverage statistics.
 
@@ -214,7 +243,7 @@ and self-contained HTML/CSS/JS. No npm install, CDN, telemetry or remote font.
 
 ## Status and credits
 
-**v0.2.0: experimental standalone observer.** Rollout schemas and hook support
+**v0.2.1: experimental standalone observer.** Rollout schemas and hook support
 vary by Codex version. Automated tests cover fixtures and installation boundaries,
 not every host/version. Global auto-registration still needs a host-trusted hook.
 

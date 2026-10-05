@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.2.1 - 2026-10-06
+
+### Bounded Cache And Reconnect Recovery
+
+- Bound rebuildable main SQLite indexes to a shared 512 MiB budget. Evict
+  least-recently-used inactive indexes, protect in-flight readers, and reserve
+  concurrent growth. Original Codex logs are never deleted.
+- Pause indexing with a visible capacity warning when active readers exhaust
+  the budget; continue serving the last safe index and resume when room returns.
+  Temporary SQLite journals and original logs are outside this index budget.
+- Preserve pending history/restore anchors while indexing is paused, and retry
+  disk-full failures after a bounded backoff. Treat invalid response encodings
+  from unrelated port occupants as failed identity checks, not startup crashes.
+- Keep the lightweight shared listener alive instead of stopping after one idle
+  hour. Idle readers still expire, and hidden pages do not parse transcripts.
+- Add `--resume --thread-id THREAD_ID` to restart/reconnect a registered chat
+  using validated persisted source identity, without automatically opening tabs.
+- Reuse the saved port when free; fall back safely if occupied, without stopping
+  the occupant or sending it credentials. Reject malformed health responses.
+- Preserve private URL fragments across client restoration, refresh credentials
+  when a new link opens in the same tab, and show actionable recovery messages.
+  Tokens still rotate on a real service restart; use a freshly verified link.
+- Add regression coverage for capacity pressure, eviction, concurrent budgets,
+  port conflicts, resume, and loss of browser session storage.
+
 ## 0.2.0 - 2026-10-03
 
 ### Reviewed History And Timeline

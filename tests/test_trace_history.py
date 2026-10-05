@@ -49,6 +49,31 @@ class HistoryTests(unittest.TestCase):
         self.assertTrue(snapshot['indexing'])
         self.assertIsNone(snapshot['next_cursor'])
 
+    def test_capacity_pause_preserves_incomplete_history_and_anchor(self):
+        self.registry.register(self.log('a', 'backfill.jsonl', count=100))
+        with patch('src.trace_viewer.history.WINDOW', 1024):
+            self.registry.snapshot('a')
+        reader = self.registry.readers['a'][0]
+        snapshot = reader._snapshot(anchor='not-indexed-yet', capacity_limited=True)
+        self.assertTrue(snapshot['indexing'])
+        self.assertIsNone(snapshot['next_cursor'])
+        self.assertFalse(any('Saved event is unavailable' in w for w in snapshot['warnings']))
+
+    def test_full_disk_retries_after_backoff_without_budget_change(self):
+        self.registry.register(self.log('a', 'disk.jsonl'))
+        self.registry.snapshot('a')
+        reader = self.registry.readers['a'][0]
+        full = sqlite3.OperationalError('database or disk is full')
+        full.sqlite_errorcode = 13
+        with patch('time.monotonic', return_value=100), patch.object(reader, 'ingest', side_effect=full):
+            self.assertTrue(reader.snapshot()['warnings'])
+        with patch('time.monotonic', return_value=101), patch.object(reader, 'ingest') as ingest:
+            reader.snapshot()
+            ingest.assert_not_called()
+        with patch('time.monotonic', return_value=161), patch.object(reader, 'ingest', wraps=reader.ingest) as ingest:
+            self.assertFalse(reader.snapshot()['warnings'])
+            self.assertTrue(ingest.called)
+
     def test_backfill_does_not_replace_newer_tool_results(self):
         payload = self.log('a', 'chunks.jsonl', count=0)
         path = Path(payload['transcript_path'])

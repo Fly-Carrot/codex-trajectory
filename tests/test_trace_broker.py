@@ -15,6 +15,93 @@ from src.trace_viewer import broker, launcher
 
 
 class BrokerTests(unittest.TestCase):
+    def test_disk_budget_evicts_old_idle_index_only(self):
+        for name in ('older', 'newer'):
+            self.registry.register(self.payload(name))
+            self.registry.snapshot(name)
+        old = self.state/'older'/'history.sqlite3'
+        new = self.state/'newer'/'history.sqlite3'
+        os.utime(old, (1, 1)); os.utime(new, (2, 2))
+        registry_bytes = (self.state/'registry.json').read_bytes()
+        source_bytes = (self.sessions/'older.jsonl').read_bytes()
+        self.now += broker.CACHE_TTL + 1
+        with patch.object(broker, 'DISK_BUDGET', new.stat().st_size+4096, create=True):
+            self.registry.evict()
+        self.assertFalse(old.exists())
+        self.assertTrue(new.exists())
+        self.assertEqual((self.state/'registry.json').read_bytes(), registry_bytes)
+        self.assertEqual((self.sessions/'older.jsonl').read_bytes(), source_bytes)
+        self.assertEqual(self.registry.snapshot('older')['events'][0]['detail'], 'public')
+
+    def test_active_cache_budget_stops_growth_with_visible_warning(self):
+        payload = self.payload('active')
+        path = Path(payload['transcript_path'])
+        with path.open('a') as stream:
+            for i in range(2000):
+                stream.write(json.dumps({'type':'response_item', 'timestamp':f'2026-10-06T00:00:00Z',
+                    'payload':{'type':'message','id':f'm-{i}','role':'user','content':'x'*400}})+'\n')
+        self.registry.register(payload)
+        with patch.object(broker, 'DISK_BUDGET', 65536, create=True):
+            result = self.registry.snapshot('active')
+            result = self.registry.snapshot('active')
+        self.assertLessEqual((self.state/'active'/'history.sqlite3').stat().st_size, 65536)
+        self.assertTrue(any('capacity' in text.lower() for text in result['warnings']))
+        self.assertGreater(path.stat().st_size, 65536)
+        reader = self.registry.readers['active'][0]
+        with patch.object(broker, 'DISK_BUDGET', 65536), patch.object(reader, 'ingest', side_effect=AssertionError('Do not retry a full index every poll')):
+            self.assertTrue(self.registry.snapshot('active')['warnings'])
+        recovered = self.registry.snapshot('active')
+        self.assertFalse(any('capacity' in text.lower() for text in recovered['warnings']))
+        self.assertTrue(recovered['events'])
+
+    def test_budget_protects_active_and_inflight_indexes(self):
+        self.registry.register(self.payload('active'))
+        self.registry.snapshot('active')
+        path = self.state/'active'/'history.sqlite3'
+        self.registry.busy['active'] = 1
+        self.now += broker.CACHE_TTL + 1
+        with patch.object(broker, 'DISK_BUDGET', 1):
+            self.registry.evict()
+        self.assertTrue(path.exists())
+        self.assertIn('active', self.registry.readers)
+
+    def test_budget_reservations_do_not_double_allocate_free_space(self):
+        for thread in ('a', 'b'):
+            self.registry.register(self.payload(thread))
+        with patch.object(broker, 'DISK_BUDGET', 65536):
+            with self.registry.lock:
+                a = self.registry.reserve_index('a')
+                b = self.registry.reserve_index('b')
+        self.assertEqual(a+b, 65536)
+
+    def test_cache_cleanup_ignores_symlinks_and_preserves_registration(self):
+        self.registry.register(self.payload('linked'))
+        directory = self.state/'linked'
+        directory.mkdir(mode=0o700)
+        victim = self.root/'untouched'
+        victim.write_text('not cache')
+        (directory/'history.sqlite3').symlink_to(victim)
+        with patch.object(broker, 'DISK_BUDGET', 1):
+            self.registry.evict()
+        self.assertEqual(victim.read_text(), 'not cache')
+        self.assertTrue((directory/'history.sqlite3').is_symlink())
+
+    def test_idle_maintenance_has_no_service_shutdown(self):
+        source = Path(broker.__file__).read_text()
+        maintenance = source.split('def cleanup_idle():',1)[1].split('threading.Thread',1)[0]
+        self.assertIn('registry.evict()', maintenance)
+        self.assertNotIn('shutdown', maintenance)
+
+    def test_occupied_saved_port_uses_new_port_without_touching_occupant(self):
+        occupant = ThreadingHTTPServer(('127.0.0.1',0), BaseHTTPRequestHandler)
+        self.addCleanup(occupant.server_close)
+        broker.write_private(self.state/'endpoint.json', {'port':occupant.server_port})
+        result = launcher.launch(self.payload('collision'), self.state, self.sessions)
+        self.addCleanup(lambda: os.kill(result['pid'], signal.SIGTERM))
+        self.assertNotEqual(broker.read_private(self.state/'endpoint.json')['port'], occupant.server_port)
+        self.assertEqual(occupant.socket.fileno() >= 0, True)
+        self.assertEqual(launcher.current_link(self.state,'collision')['url'], result['url'])
+
     def test_loopback_startup_does_not_require_reverse_dns(self):
         with patch('socket.getfqdn', side_effect=AssertionError('Loopback must not use DNS')):
             server = broker.BrokerServer(self.registry)

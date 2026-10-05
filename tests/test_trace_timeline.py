@@ -11,6 +11,50 @@ HTML = Path(__file__).resolve().parents[1] / 'src/trace_viewer/index.html'
 
 @unittest.skipUnless(shutil.which('node'), 'Node is needed to execute browser layout logic')
 class TimelineLayoutTests(unittest.TestCase):
+    def auth_bootstrap(self, body):
+        source = HTML.read_text()
+        script = source[source.index('const threadPath='):source.index('const endpoint=')]
+        setup = '''
+const vm=require('node:vm');
+function boot(url, saved={}, storageBlocked=false){
+ const location=new URL(url), store={...saved},handlers={};let reloads=0;
+ location.reload=()=>reloads++;
+ const context={location,window:{addEventListener:(name,fn)=>handlers[name]=fn},sessionStorage:{
+  getItem(key){if(storageBlocked)throw Error('blocked');return store[key]||null},
+  setItem(key,value){if(storageBlocked)throw Error('blocked');store[key]=value}},
+  history:{replaceState(a,b,path){location.href=new URL(path,location).href}}};
+ vm.createContext(context);
+ vm.runInContext(SCRIPT+';globalThis.result=token;',context);
+ return {url:location.href,token:context.result,store,changeHash(hash){location.hash=hash;handlers.hashchange?.();return reloads}};
+}
+'''.replace('SCRIPT', json.dumps(script))
+        result = subprocess.run(['node', '-e', setup+body], check=True, capture_output=True, text=True)
+        return json.loads(result.stdout)
+
+    def test_client_restart_preserves_access_without_session_storage(self):
+        state = self.auth_bootstrap("const first=boot('http://127.0.0.1:1234/t/a#test-token');const restarted=boot(first.url);console.log(JSON.stringify(restarted));")
+        self.assertEqual(state['token'], 'test-token')
+
+    def test_legacy_session_link_is_upgraded_before_restart(self):
+        state = self.auth_bootstrap("const first=boot('http://127.0.0.1:1234/t/a',{'trace-token:/t/a':'test-token'});console.log(JSON.stringify(boot(first.url)));")
+        self.assertEqual(state['token'], 'test-token')
+
+    def test_storage_blocked_still_preserves_explicit_link(self):
+        state = self.auth_bootstrap("const first=boot('http://127.0.0.1:1234/t/a#test-token',{},true);console.log(JSON.stringify(boot(first.url,{},true)));")
+        self.assertEqual(state['token'], 'test-token')
+
+    def test_missing_link_never_borrows_another_chat_credential(self):
+        state = self.auth_bootstrap("console.log(JSON.stringify(boot('http://127.0.0.1:1234/t/b',{'trace-token:/t/a':'private-a'})));")
+        self.assertEqual(state['token'], '')
+
+    def test_explicit_new_link_wins_over_stale_session_token(self):
+        state = self.auth_bootstrap("console.log(JSON.stringify(boot('http://127.0.0.1:1234/t/a#new-token',{'trace-token:/t/a':'old-token'})));")
+        self.assertEqual(state['token'], 'new-token')
+
+    def test_new_fragment_on_existing_tab_reloads_authentication(self):
+        state = self.auth_bootstrap("const tab=boot('http://127.0.0.1:1234/t/a#old-token');console.log(JSON.stringify({same:tab.changeHash('#old-token'),new:tab.changeHash('#new-token')}));")
+        self.assertEqual(state, {'same': 0, 'new': 1})
+
     def test_all_lanes_fixed_even_without_events(self):
         expected = ['User','Command','File','MCP','Subagents','Context','Plan','Search','Other Tools','Tool Results','Artifacts','Agent']
         for events in ([], [{'category':'ASSISTANT'}], [{'category':'AGENT'}]):
@@ -160,6 +204,31 @@ function renderLedger(){} function saveView(){} function fetchDetail(){}
 @unittest.skipUnless(shutil.which('node'), 'Node is needed for frontend execution')
 class HistoryFrontendTests(unittest.TestCase):
     """Execute the shipped script with a small DOM and deterministic HTTP queue."""
+
+    def test_missing_token_stops_requests_and_explains_recovery(self):
+        self.run_frontend('''
+token='';await poll();
+assert.equal(requests.length,0);assert.equal(reconnect,true);
+assert.match($('recovery').textContent,/missing its access link/);
+await poll();assert.equal(requests.length,0);
+''')
+
+    def test_expired_token_keeps_authentication_and_explains_recovery(self):
+        self.run_frontend('''
+responses.push({status:401});await poll();
+assert.equal(reconnect,true);assert.match($('recovery').textContent,/expired/);
+assert.equal(requests[0].options.headers.Authorization,'Bearer auth-secret');
+await poll();assert.equal(requests.length,1);
+''')
+
+    def test_transient_failure_retries_and_clears_recovery_message(self):
+        self.run_frontend('''
+responses.push(()=>{throw Error('offline')});await poll();
+assert.equal(reconnect,false);assert.equal($('recovery').hidden,false);
+assert.match($('recovery').textContent,/Retrying automatically/);
+responses.push(page([event(1)]));await poll();
+assert.equal($('recovery').hidden,true);assert.equal($('status').textContent,'Live');
+''')
 
     def run_frontend(self, body, saved=None):
         script = HTML.read_text().split('<script>', 1)[1].split('</script>', 1)[0]
