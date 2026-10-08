@@ -14,13 +14,14 @@ from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from src.trace_viewer import launcher
+from src.trace_viewer.broker import Registry
 
 
 class LauncherTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.sessions = self.root / 'sessions'
         self.sessions.mkdir()
         self.log = self.sessions / 'log.jsonl'
@@ -39,6 +40,177 @@ class LauncherTests(unittest.TestCase):
             'schema': launcher.SERVICE_SCHEMA, 'sessions_root': str(self.sessions.resolve()),
             'threads': {'thread-test': {'log': str(self.log), 'token': 'private-token'}}})
         return state
+
+    def test_resume_uses_surviving_registered_segment(self):
+        with self.log.open('a') as stream:
+            stream.write(json.dumps({'type': 'response_item', 'payload': {
+                'type': 'message', 'id': 'surviving-event', 'role': 'user',
+                'content': 'surviving history'}}) + '\n')
+        state = self.root / 'state'
+        registry = Registry(state, self.sessions)
+        registry.register(self.payload)
+        latest = self.sessions / 'latest.jsonl'
+        latest.write_bytes(self.log.read_bytes())
+        registry.register({**self.payload, 'transcript_path': str(latest)})
+        latest.unlink()
+        self.assertEqual(registry.entries['thread-test']['log'], str(latest))
+        self.assertEqual(set(registry.entries['thread-test']['logs']),
+                         {str(self.log), str(latest)})
+        # History already tolerates a missing latest segment; resume must too.
+        snapshot = registry.snapshot('thread-test')
+        self.assertEqual([event['id'] for event in snapshot['events']], ['item:surviving-event'])
+        self.assertTrue(snapshot['warnings'])
+        with patch.object(launcher, 'launch', return_value={'url': 'verified'}) as launch:
+            self.assertEqual(launcher.resume(state, 'thread-test', self.sessions), {'url': 'verified'})
+        self.assertEqual(launch.call_args.args[0]['transcript_path'], str(self.log))
+        self.assertFalse(launch.call_args.kwargs['auto_open'])
+
+    def test_resume_prefers_valid_current_over_registered_history(self):
+        state = self.registered_state()
+        historical = self.sessions / 'z-history.jsonl'
+        historical.write_bytes(self.log.read_bytes())
+        value = launcher.read_private(state / 'registry.json')
+        value['threads']['thread-test']['logs'] = [str(self.log), str(historical)]
+        launcher.write_private(state / 'registry.json', value)
+        with patch.object(launcher, 'launch', return_value={'url': 'verified'}) as launch:
+            launcher.resume(state, 'thread-test', self.sessions)
+        self.assertEqual(launch.call_args.args[0]['transcript_path'], str(self.log))
+
+    def test_resume_revalidates_every_fallback_candidate(self):
+        state = self.registered_state()
+        value = launcher.read_private(state / 'registry.json')
+        entry = value['threads']['thread-test']
+        entry['log'] = str(self.sessions / 'missing.jsonl')
+        headers = {
+            'wrong-thread': {'type': 'session_meta', 'payload': {'id': 'other'}},
+            'subagent': {'type': 'session_meta', 'payload': {'id': 'thread-test', 'source': 'subagent'}},
+            'exec': {'type': 'session_meta', 'payload': {'id': 'thread-test', 'source': 'exec'}},
+            'structured-source': {'type': 'session_meta', 'payload': {'id': 'thread-test', 'source': {'subagent': 'worker'}}},
+            'thread-source': {'type': 'session_meta', 'payload': {'id': 'thread-test', 'thread_source': 'agent'}},
+            'wrong-type': {'type': 'response_item', 'payload': {'id': 'thread-test'}},
+            'non-object': [],
+            'non-object-payload': {'type': 'session_meta', 'payload': []},
+        }
+        candidates = []
+        for name, header in headers.items():
+            candidate = self.sessions / (name + '.jsonl')
+            candidate.write_text(json.dumps(header) + '\n')
+            candidates.append((name, candidate))
+        for name, raw in (('invalid-json', b'{broken\n'), ('invalid-utf8', b'\xff\n')):
+            candidate = self.sessions / (name + '.jsonl')
+            candidate.write_bytes(raw)
+            candidates.append((name, candidate))
+        outside = self.root / 'outside.jsonl'
+        outside.write_bytes(self.log.read_bytes())
+        candidates.append(('outside-root', outside))
+        symlink = self.sessions / 'symlink.jsonl'
+        symlink.symlink_to(self.log)
+        candidates.append(('leaf-symlink', symlink))
+        directory = self.sessions / 'real-parent'
+        directory.mkdir()
+        (directory / 'log.jsonl').write_bytes(self.log.read_bytes())
+        alias = self.sessions / 'alias-parent'
+        alias.symlink_to(directory, target_is_directory=True)
+        candidates.append(('parent-symlink', alias / 'log.jsonl'))
+        fifo = self.sessions / 'fifo.jsonl'
+        os.mkfifo(fifo)
+        candidates.append(('fifo', fifo))
+        candidates.append(('directory', directory))
+        for name, candidate in candidates:
+            with self.subTest(source=name):
+                entry['logs'] = [str(candidate)]
+                launcher.write_private(state / 'registry.json', value)
+                with patch.object(launcher, 'launch') as launch:
+                    with self.assertRaises(ValueError):
+                        launcher.resume(state, 'thread-test', self.sessions)
+                    launch.assert_not_called()
+                # An invalid candidate may be skipped, never used as a source.
+                entry['logs'] = [str(self.log), str(candidate)]
+                launcher.write_private(state / 'registry.json', value)
+                with patch.object(launcher, 'launch', return_value={'url': 'verified'}) as launch:
+                    launcher.resume(state, 'thread-test', self.sessions)
+                self.assertEqual(launch.call_args.args[0]['transcript_path'], str(self.log))
+
+    def test_resume_does_not_discover_unregistered_same_thread_sources(self):
+        state = self.registered_state()
+        unregistered = self.sessions / 'rollout-thread-test-unregistered.jsonl'
+        unregistered.write_bytes(self.log.read_bytes())
+        value = launcher.read_private(state / 'registry.json')
+        value['threads']['thread-test'].update({
+            'log': str(self.sessions / 'missing-current.jsonl'),
+            'logs': [str(self.sessions / 'missing-history.jsonl')]})
+        launcher.write_private(state / 'registry.json', value)
+        with patch.object(launcher, 'launch') as launch:
+            with self.assertRaises(ValueError):
+                launcher.resume(state, 'thread-test', self.sessions)
+            launch.assert_not_called()
+
+    def test_resume_rejects_source_retargeted_during_validation(self):
+        state = self.registered_state()
+        target = self.sessions / 'unregistered.jsonl'
+        target.write_bytes(self.log.read_bytes())
+        resolve = launcher.resolve_session
+
+        def retarget(payload, sessions):
+            self.log.unlink()
+            self.log.symlink_to(target)
+            return resolve(payload, sessions)
+
+        with patch.object(launcher, 'resolve_session', side_effect=retarget), \
+             patch.object(launcher, 'launch') as launch:
+            with self.assertRaises(ValueError):
+                launcher.resume(state, 'thread-test', self.sessions)
+            launch.assert_not_called()
+
+    def test_resume_rejects_malformed_logs_before_using_valid_current(self):
+        state = self.registered_state()
+        value = launcher.read_private(state / 'registry.json')
+        for logs in (None, str(self.log), [None], ['']):
+            with self.subTest(logs=logs), patch.object(launcher, 'launch') as launch:
+                value['threads']['thread-test']['logs'] = logs
+                launcher.write_private(state / 'registry.json', value)
+                with self.assertRaises(ValueError):
+                    launcher.resume(state, 'thread-test', self.sessions)
+                launch.assert_not_called()
+
+    def test_resume_surviving_segment_after_real_service_exit(self):
+        with self.log.open('a') as stream:
+            stream.write(json.dumps({'type': 'response_item', 'payload': {
+                'type': 'message', 'id': 'surviving-event', 'role': 'user',
+                'content': 'surviving history'}}) + '\n')
+        original = self.log.read_bytes()
+        state = self.root / 'state'
+        first = launcher.launch(self.payload, state, self.sessions)
+        try:
+            latest = self.sessions / 'latest.jsonl'
+            latest.write_bytes(original)
+            second = launcher.launch({**self.payload, 'transcript_path': str(latest)}, state, self.sessions)
+            self.assertEqual(second['pid'], first['pid'])
+        finally:
+            os.kill(first['pid'], signal.SIGTERM)
+        deadline = time.monotonic() + 5
+        while (state / 'service.json').exists() and time.monotonic() < deadline:
+            time.sleep(.05)
+        self.assertFalse((state / 'service.json').exists())
+        latest.unlink()
+        with patch.object(launcher, 'open_browser') as opened:
+            result = launcher.resume(state, 'thread-test', self.sessions)
+        self.addCleanup(lambda: os.kill(result['pid'], signal.SIGTERM))
+        self.assertEqual(result['status'], 'started')
+        self.assertNotEqual(result['url'], second['url'])
+        self.assertEqual(launcher.current_link(state, 'thread-test')['url'], result['url'])
+        self.assertFalse(result['opened'])
+        opened.assert_not_called()
+        url = launcher.urlsplit(result['url'])
+        origin = url._replace(path='', query='', fragment='').geturl()
+        snapshot = launcher.request(origin, '/api/threads/thread-test/events', url.fragment)
+        self.assertEqual([event['id'] for event in snapshot['events']], ['item:surviving-event'])
+        self.assertTrue(snapshot['warnings'])
+        entry = launcher.read_private(state / 'registry.json')['threads']['thread-test']
+        self.assertEqual(entry['log'], str(self.log))
+        self.assertEqual(set(entry['logs']), {str(self.log), str(latest)})
+        self.assertEqual(self.log.read_bytes(), original)
+        self.assertFalse(latest.exists())
 
     def test_resume_starts_dead_service_and_returns_verified_fresh_url(self):
         state = self.registered_state()
