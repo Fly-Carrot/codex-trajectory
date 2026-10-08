@@ -196,7 +196,22 @@ def resume(state, thread, sessions=None):
         raise ValueError('No registered source for this exact thread')
     payload = {'hook_event_name': 'UserPromptSubmit', 'session_id': thread,
                'transcript_path': entry['log']}
-    resolve_session(payload, sessions)
+    # Prefer the current source, then only previously registered segments.
+    # Persisted paths are canonical; never follow a replacement symlink.
+    for source in dict.fromkeys([entry['log'], *reversed(entry.get('logs', []))]):
+        path = Path(source)
+        try:
+            if path.resolve(strict=True) != path:
+                raise ValueError('Registered source path changed')
+            _, verified = resolve_session({**payload, 'transcript_path': str(path)}, sessions)
+            if verified != path:
+                raise ValueError('Registered source path changed')
+        except (OSError, ValueError, TypeError):
+            continue
+        payload['transcript_path'] = str(verified)
+        break
+    else:
+        raise ValueError('No available registered source for this exact thread')
     result = launch(payload, state=state, sessions=sessions, auto_open=False)
     if not result.get('url'):
         raise RuntimeError('Resume did not produce a verified link; retry after the active launch')
