@@ -203,6 +203,18 @@ class SegmentTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.registry.snapshot('a')
 
+    def test_shifted_header_cannot_hide_old_record_proofs(self):
+        payload = self.log('a', 'a.jsonl', count=2)
+        self.registry.register(payload)
+        self.registry.snapshot('a')
+        target = self.move(payload, compressed=True)
+        changed = (json.dumps({'type':'session_meta','payload':{'id':'a','padding':'x'*1024}})+'\n'+
+                   json.dumps({'type':'response_item','payload':{'type':'message','id':'message-0',
+                               'role':'user','content':'REPLACED'}})+'\n')
+        target.write_bytes(compress(changed.encode()))
+        with self.assertRaises(ValueError):
+            self.registry.snapshot('a')
+
     def test_failed_detail_does_not_reset_compressed_progress(self):
         payload = self.log('a', 'a.jsonl')
         self.registry.register(payload)

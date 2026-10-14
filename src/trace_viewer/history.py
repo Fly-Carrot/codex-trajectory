@@ -173,6 +173,9 @@ class HistoryReader:
             end = old['start'] if old and backward else info.st_size
             start = max(0, end - WINDOW) if backward or not old else old['offset']
             if compressed:
+                if not old and db.execute('SELECT 1 FROM record_proofs WHERE path=? AND offset<? LIMIT 1',
+                                          (path, stream.tell())).fetchone():
+                    raise ValueError('Compressed header overlaps indexed records')
                 start = old['offset'] if old else stream.tell()
                 try:
                     source.advance(start, WINDOW)
@@ -198,6 +201,11 @@ class HistoryReader:
                 if not raw:
                     eof = True
                     break
+                proof = db.execute('SELECT offset,length,digest FROM record_proofs WHERE path=? AND offset>=? AND offset<? ORDER BY offset LIMIT 1',
+                                   (path, offset, stream.tell())).fetchone()
+                digest = hashlib.sha256(raw).hexdigest()
+                if proof and (proof['offset'] != offset or proof['length'] != len(raw) or proof['digest'] != digest):
+                    raise ValueError('Indexed source record changed; history index needs explicit rebuild')
                 if dropping:
                     dropping = not raw.endswith(b'\n')
                     continue
@@ -210,10 +218,6 @@ class HistoryReader:
                         raise ValueError('Compressed source has an incomplete final record')
                     stream.seek(offset)
                     break
-                digest = hashlib.sha256(raw).hexdigest()
-                proof = db.execute('SELECT length,digest FROM record_proofs WHERE path=? AND offset=?', (path, offset)).fetchone()
-                if proof and (proof['length'] != len(raw) or proof['digest'] != digest):
-                    raise ValueError('Indexed source record changed; history index needs explicit rebuild')
                 try:
                     record = json.loads(raw)
                     payload = record.get('payload', {})
