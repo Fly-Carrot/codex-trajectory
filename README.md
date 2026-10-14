@@ -37,6 +37,13 @@ Requires **Python 3.10+**, macOS or Linux, and a local Codex client that writes
 supported rollout logs. Windows is not supported (POSIX file locking).
 Node is only used by JavaScript regression tests, not by the viewer.
 
+For compressed Codex history (`.jsonl.zst`), use **Python 3.14+** (built-in
+decoder). On Python 3.10-3.13, install `backports.zstd` in the same environment
+used to run the installer: `python3 -m pip install backports.zstd`.
+Plain JSONL viewing does not require this optional package.
+See [segment recovery and limits](docs/segment-recovery.md) for archive handling,
+resource bounds, and the upstream projects informing the fix.
+
 ```sh
 git clone https://github.com/Fly-Carrot/codex-trajectory.git
 cd codex-trajectory

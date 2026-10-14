@@ -22,9 +22,11 @@ from urllib.parse import urlsplit, parse_qs
 try:
     from .server import Handler as BaseHandler, RolloutReader, LoopbackHTTPServer, open_regular_source
     from .history import HistoryReader, decode_cursor
+    from .sources import Source, logical_path
 except ImportError:
     from server import Handler as BaseHandler, RolloutReader, LoopbackHTTPServer, open_regular_source
     from history import HistoryReader, decode_cursor
+    from sources import Source, logical_path
 
 THREAD = re.compile(r'[a-zA-Z0-9][a-zA-Z0-9_-]{0,100}')
 MAX_READERS = 8
@@ -79,18 +81,10 @@ def resolve_session(payload, sessions):
     thread = str(payload.get('session_id', ''))
     if not THREAD.fullmatch(thread):
         raise ValueError('Invalid thread identity')
-    log = Path(payload.get('transcript_path') or '').resolve(strict=True)
-    if not log.is_file() or not log.is_relative_to(Path(sessions).resolve(strict=True)):
-        raise ValueError('Transcript is outside the sessions directory')
-    with open_regular_source(log) as stream:
-        meta = json.loads(stream.readline(8 * 1024 * 1024))
-    if not isinstance(meta, dict) or not isinstance(meta.get('payload'), dict):
-        raise ValueError('Invalid source header')
-    data = meta.get('payload', {})
-    if meta.get('type') != 'session_meta' or data.get('id') != thread:
-        raise ValueError('Transcript does not match the thread')
-    if data.get('thread_source') not in (None, 'user') or isinstance(data.get('source'), dict) or data.get('source') in ('exec', 'subagent'):
-        raise ValueError('Only main user conversations can be registered')
+    log = logical_path(Path(payload.get('transcript_path') or '').resolve(strict=False),
+                       Path(sessions).resolve(strict=True))
+    with Source(log, Path(sessions).resolve(strict=True), thread):
+        pass
     return thread, log
 
 
@@ -219,8 +213,7 @@ class Registry:
             entry = self.entries[thread]
             # Re-check containment on every read, including replaced parent directories.
             path = Path(entry['log'])
-            if path.resolve(strict=False) != path or not path.is_relative_to(self.sessions):
-                raise ValueError('Registered source path changed')
+            logical_path(path, self.sessions)
             if thread not in self.readers:
                 while len(self.readers) >= MAX_READERS:
                     self.readers.popitem(last=False)

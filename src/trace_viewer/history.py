@@ -8,14 +8,16 @@ import sqlite3
 import stat
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 
 try:
     from .events import normalize, merge_event
+    from .sources import Source, SourcePending, locate, identity as source_identity
     from .server import MAX_LINE, WINDOW, final_references, verified_reference, open_regular_source
 except ImportError:
     from events import normalize, merge_event
+    from sources import Source, SourcePending, locate, identity as source_identity
     from server import MAX_LINE, WINDOW, final_references, verified_reference, open_regular_source
 
 PAGE_EVENTS = 300
@@ -69,6 +71,8 @@ class HistoryReader:
         finally:
             os.close(fd)
         self.initialized = False
+        self.compressed_source = None
+        self.compressed_done = {}
         self.disk_limit_bytes = None
         self.capacity_limit_hit = None
         self.capacity_retry_at = 0
@@ -116,40 +120,60 @@ class HistoryReader:
             db.close()
 
     def open_source(self, path):
-        path = Path(path)
-        if path.resolve(strict=True) != path or not path.is_relative_to(self.sessions):
-            raise ValueError('Source path changed')
-        stream = open_regular_source(path)
-        try:
-            header = json.loads(stream.readline(8 * MAX_LINE))
-            if not isinstance(header, dict) or not isinstance(header.get('payload'), dict):
-                raise ValueError('Invalid source header')
-            meta = header.get('payload', {})
-            if header.get('type') != 'session_meta' or meta.get('id') != self.thread:
-                raise ValueError('Wrong source thread')
-            if meta.get('thread_source') not in (None, 'user') or isinstance(meta.get('source'), dict) or meta.get('source') in ('exec', 'subagent'):
-                raise ValueError('Not a main chat')
-            return stream, meta
-        except Exception:
-            stream.close()
-            raise
+        return Source(path, self.sessions, self.thread)
+
+    def close(self):
+        if getattr(self, 'compressed_source', None):
+            self.compressed_source[1].close()
+            self.compressed_source = None
+
+    def __del__(self):
+        self.close()
 
     def ingest(self, db, path, backward=False):
-        stream, _ = self.open_source(path)
-        with stream:
-            info = os.fstat(stream.fileno())
-            identity = f'{info.st_dev}:{info.st_ino}'
-            old = db.execute('SELECT * FROM sources WHERE path=?', (path,)).fetchone()
-            if old and (old['identity'] != identity or info.st_size < old['offset']):
-                raise ValueError('Source replaced or truncated; history index needs explicit rebuild')
-            if old and not backward and old['offset'] == info.st_size:
+        source = self.open_source(path)
+        compressed = source.compressed
+        identity, info = source.identity, source.info
+        if compressed:
+            if self.compressed_done.get(path) == identity:
+                source.close()
                 return False
-            if old and backward and old['start'] == 0:
+            if self.compressed_source:
+                key, existing = self.compressed_source
+                if key == path and existing.identity == identity:
+                    source.close()
+                    source = existing
+                else:
+                    existing.close()
+            self.compressed_source = (path, source)
+        with (nullcontext() if compressed else source):
+            stream = source.stream
+            old = db.execute('SELECT * FROM sources WHERE path=?', (path,)).fetchone()
+            if old and old['identity'] != identity:
+                if compressed or old['identity'].startswith('zstd:'):
+                    # Representation changes restart bounded indexing; refs retain
+                    # logical paths and uncompressed byte offsets for lazy checks.
+                    old = None
+                else:
+                    raise ValueError('Source replaced or truncated; history index needs explicit rebuild')
+            if old and not compressed and info.st_size < old['offset']:
+                raise ValueError('Source replaced or truncated; history index needs explicit rebuild')
+            if old and not compressed and not backward and old['offset'] == info.st_size:
+                return False
+            if old and backward and (compressed or old['start'] == 0):
                 return False
             end = old['start'] if old and backward else info.st_size
             start = max(0, end - WINDOW) if backward or not old else old['offset']
-            stream.seek(start)
-            if start and (backward or not old):
+            if compressed:
+                start = old['offset'] if old else stream.tell()
+                try:
+                    source.advance(start, WINDOW)
+                except SourcePending:
+                    return False
+                end = start + WINDOW
+            else:
+                stream.seek(start)
+            if not compressed and start and (backward or not old):
                 # Align at a complete source record; never parse a partial JSON line.
                 while stream.tell() < end:
                     part = stream.readline(min(MAX_LINE + 1, end - stream.tell()))
@@ -159,10 +183,12 @@ class HistoryReader:
             turn = old['turn'] if old and not backward else ''
             dropping = bool(old['dropping']) if old and not backward else False
             skipped = 0
+            eof = False
             while stream.tell() < end and stream.tell() - begin < WINDOW:
                 offset = stream.tell()
                 raw = stream.readline(MAX_LINE + 1)
                 if not raw:
+                    eof = True
                     break
                 if dropping:
                     dropping = not raw.endswith(b'\n')
@@ -172,6 +198,8 @@ class HistoryReader:
                     skipped += 1
                     continue
                 if not raw.endswith(b'\n'):
+                    if compressed:
+                        raise ValueError('Compressed source has an incomplete final record')
                     stream.seek(offset)
                     break
                 try:
@@ -213,10 +241,14 @@ class HistoryReader:
                     skipped += 1
             finish = stream.tell()
             db.execute('INSERT OR REPLACE INTO sources VALUES(?,?,?,?,?,?,?)',
-                       (path, identity, (start if begin >= end else begin) if not old or backward else old['start'],
+                       (path, identity, 0 if compressed else ((start if begin >= end else begin) if not old or backward else old['start']),
                         old['offset'] if old and backward else finish,
                         old['turn'] if old and backward else turn, (old['skipped'] if old else 0) + skipped,
                         old['dropping'] if old and backward else int(dropping)))
+            if compressed:
+                if eof:
+                    self.compressed_done[path] = identity
+                    self.close()
             if finish != begin:
                 db.execute("UPDATE metadata SET value=value+1 WHERE key='version'")
             return True
@@ -229,10 +261,10 @@ class HistoryReader:
         for path, offset, length, digest in json.loads(row['refs']):
             if path not in self.paths:
                 continue
-            stream, meta = self.open_source(path)
-            with stream:
-                stream.seek(offset)
-                raw = stream.read(min(length, MAX_LINE))
+            with self.open_source(path) as source:
+                meta = source.meta
+                source.advance(offset)
+                raw = source.stream.read(min(length, MAX_LINE))
             if hashlib.sha256(raw).hexdigest() != digest:
                 raise ValueError('Indexed source record changed')
             record = json.loads(raw)
@@ -270,6 +302,8 @@ class HistoryReader:
                 self.capacity_limit_hit = None
                 return result
             except sqlite3.OperationalError as exc:
+                self.close()
+                self.compressed_done.clear()
                 # Python 3.10 lacks sqlite_errorcode; keep its exact FULL message fallback.
                 if (getattr(exc, 'sqlite_errorcode', None) != 13
                         and str(exc) != 'database or disk is full'):
@@ -279,15 +313,30 @@ class HistoryReader:
                 # The failed transaction rolls back; keep serving the last safe
                 # snapshot rather than deleting active history or growing forever.
                 return self._snapshot(before, detail, anchor, capacity_limited=True)
+            except Exception:
+                self.close()
+                self.compressed_done.clear()
+                raise
 
     def _snapshot(self, before=None, detail=None, anchor=None, capacity_limited=False):
         boundary = decode_cursor(before) if before else None
         with self.connect() as db:
             if detail:
-                return {'event': self.full_event(db, detail)}
-            if not any(Path(path).exists() for path in self.paths):
+                try:
+                    return {'event': self.full_event(db, detail)}
+                except SourcePending as exc:
+                    return {'event': None, 'detail_warning': str(exc)}
+            available, missing = {}, []
+            for path in self.paths:
+                try:
+                    available[path] = locate(path, self.sessions)
+                except FileNotFoundError:
+                    missing.append(path)
+            if not available:
                 raise FileNotFoundError('All registered source segments are unavailable')
             warnings = ['Index cache capacity reached. New indexing is paused; close unused viewers to free cache. Source logs are unchanged.'] if capacity_limited else []
+            if missing:
+                warnings.append('A registered segment is unavailable')
             changed = False
             # Reserve one of eight chunks for backfill; rotate forward sources fairly.
             position = db.execute("SELECT value FROM metadata WHERE key='source_position'").fetchone()
@@ -295,6 +344,16 @@ class HistoryReader:
             paths = self.paths[::-1]
             count = min(7, len(paths))
             scheduled = [paths[(position+i) % len(paths)] for i in range(count)]
+            # Keep one decoder per chat and finish its bounded forward scan before
+            # selecting another compressed segment. Live plain logs stay in rotation.
+            compressed = [p for p, (physical, info) in available.items()
+                          if physical.name.endswith('.jsonl.zst')
+                          and self.compressed_done.get(p) != source_identity(physical, info)]
+            active = self.compressed_source[0] if self.compressed_source else None
+            selected = active if active in compressed else next(iter(compressed), None)
+            scheduled = [p for p in scheduled if p in available and not available[p][0].name.endswith('.jsonl.zst')]
+            if selected:
+                scheduled = scheduled[:6] + [selected]
             if not capacity_limited:
                 db.execute("INSERT OR REPLACE INTO metadata VALUES('source_position',?)",
                            ((position+count) % max(1, len(paths)),))
@@ -307,16 +366,22 @@ class HistoryReader:
             # Backfill one bounded historical chunk only while a page is open.
             # Paging is marked indexing until all earlier ranges are indexed.
             for source in ([] if capacity_limited else reversed(indexed)):
-                if source['start'] > 0:
+                if source['start'] > 0 and source['path'] in available and not available[source['path']][0].name.endswith('.jsonl.zst'):
                     try:
                         changed = self.ingest(db, source['path'], backward=True) or changed
                         break
                     except FileNotFoundError:
                         warnings.append('A registered segment is unavailable')
             indexed = db.execute('SELECT * FROM sources ORDER BY path').fetchall()
-            pending = (any(Path(row['path']).exists() and Path(row['path']).stat().st_size > row['offset'] for row in indexed)
-                       or any(path not in {row['path'] for row in indexed} and Path(path).exists() for path in self.paths)
-                       or any(row['start'] > 0 and Path(row['path']).exists() for row in indexed))
+            rows_by_path = {row['path']: row for row in indexed}
+            pending = False
+            for path, (physical, info) in available.items():
+                row = rows_by_path.get(path)
+                if physical.name.endswith('.jsonl.zst'):
+                    pending |= self.compressed_done.get(path) != source_identity(physical, info)
+                else:
+                    pending |= (row is None or row['identity'] != source_identity(physical, info)
+                                or info.st_size > row['offset'] or row['start'] > 0)
             # Never hand out a cursor over an incomplete index: late backfill could
             # otherwise insert records beyond a cursor already consumed by a client.
             if pending:
@@ -346,6 +411,12 @@ class HistoryReader:
             reference_budget = 32
             for event in reversed(events):
                 if event.get('reply_phase') == 'Final' and reference_budget:
+                    # Do not repeatedly decompress historical details on every
+                    # refresh just to infer artifact links; explicit clicks may read them.
+                    refs = db.execute('SELECT refs FROM events WHERE id=?', (event['id'],)).fetchone()
+                    if refs and any(r[0] in available and available[r[0]][0].name.endswith('.jsonl.zst')
+                                    for r in json.loads(refs[0])):
+                        continue
                     try:
                         event['artifacts'] = self.full_event(db, event['id'], min(16, reference_budget)).get('artifacts', [])
                     except (OSError, ValueError):

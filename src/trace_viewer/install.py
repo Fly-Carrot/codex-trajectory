@@ -13,7 +13,7 @@ import tempfile
 
 BEGIN = '<!-- CODEX-TRAJECTORY:BEGIN -->'
 END = '<!-- CODEX-TRAJECTORY:END -->'
-FILES = ('events.py', 'server.py', 'history.py', 'broker.py', 'launcher.py', 'index.html', 'install.py')
+FILES = ('events.py', 'server.py', 'sources.py', 'history.py', 'broker.py', 'launcher.py', 'index.html', 'install.py')
 
 
 def atomic(path, data):

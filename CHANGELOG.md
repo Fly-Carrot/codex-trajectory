@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.2 - 2026-10-14
+
+### Compressed And Archived History
+
+- Resolve registered logical segments to their plain, Zstandard-compressed, or
+  exact-name archived representations. Keep original transcripts read-only.
+- Validate the exact main-chat identity after opening through no-follow directory
+  handles. Never substitute another chat or follow symlinked transcript roots.
+- Index compressed history in bounded forward chunks with one retained decoder
+  per active chat, not full-file decompression to disk. Preserve logical byte
+  offsets and validate detail hashes. Keep the existing shared index budget.
+- Resume from a surviving registered segment when the latest pointer is missing,
+  including compressed/archived sources (incorporates the fix proposed in #3).
+- Use Python 3.14's Zstandard decoder, or optional `backports.zstd` on older
+  supported Python versions. Corrupt frames fail explicitly. Very distant
+  compressed details have a scan limit; summaries remain browsable.
+- Add migration, restart, bounded-progress, multi-frame, Unicode, corruption,
+  source-identity and symlink regression tests, plus Python 3.14 CI coverage.
+
 ## 0.2.1 - 2026-10-06
 
 ### Bounded Cache And Reconnect Recovery
