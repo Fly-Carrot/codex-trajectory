@@ -196,6 +196,7 @@ async function fetchDetail(event){
  try{const data=await requestEvents('?detail='+encodeURIComponent(id));
   if(request!==detailRequest||selected!==event.id||revision!==eventRevision(event))return;
   if(data.event&&data.event.id===id){detailId=id;detailEvent=data.event;inspectSelected(event)}
+  if(typeof data.detail_warning==='string')$('inspect-body').textContent+='\n\n'+data.detail_warning;
  }catch(error){if(request===detailRequest)reportError(error)}
 }
 function showEvent(event){
