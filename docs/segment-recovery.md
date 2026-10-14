@@ -60,6 +60,10 @@ access independently. A matching filename alone is insufficient.
   bounded record. One decoder is retained per active chat, with an 8 MiB maximum
   Zstandard window. Header validation is capped at 8 MiB. Idle reader eviction
   releases decoder resources. No decoded transcript copy is written to disk.
+- Each decoder operation also caps compressed input at 16 MiB and checks a
+  two-second deadline between raw reads. Excessive skippable-frame input is
+  rejected, not allowed to bypass the decoded-output budget. This is a cooperative
+  I/O deadline, not an OS-level hard CPU timeout.
 - Restart may need bounded forward replay to reach an existing logical offset.
   The interface remains in indexing state until coverage is ready; a missing
   segment still produces a warning and is not silently forgotten.
@@ -67,6 +71,10 @@ access independently. A matching filename alone is insufficient.
   More distant details return a clear limit notice; indexed summaries stay
   available. Automatic artifact discovery does not repeatedly decompress archived
   final replies during refresh; explicit detail inspection can resolve them.
+- A disk-backed proof table preserves hashes of indexed public records, including
+  migration from existing detail references. Changed or missing indexed records
+  in a replacement representation are rejected instead of mixing old and new
+  content. This table shares the existing SQLite index capacity limit.
 - Source identity and per-record hashes guard detail reads. This is not a signed
   audit store or proof that a locally writable transcript cannot be altered.
 - Updating installed files does not hot-patch an existing observer process.

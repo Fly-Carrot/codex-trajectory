@@ -181,6 +181,54 @@ class SegmentTests(unittest.TestCase):
         path.unlink()
         self.assertEqual(self.registry.snapshot('a')['events'][0]['detail'], 'bird-\u9e1f-0')
 
+    def test_changed_compressed_representation_cannot_reuse_old_events(self):
+        payload = self.log('a', 'a.jsonl', count=2)
+        self.registry.register(payload)
+        self.registry.snapshot('a')
+        target = self.move(payload, compressed=True)
+        changed = (json.dumps({'type':'session_meta','payload':{'id':'a'}})+'\n'+
+                   json.dumps({'type':'response_item','timestamp':'2026-10-03T00:00:00Z',
+                               'payload':{'type':'message','id':'message-0','role':'user','content':'REPLACED'}})+'\n')
+        target.write_bytes(compress(changed.encode()))
+        with self.assertRaises(ValueError):
+            self.registry.snapshot('a')
+
+    def test_truncated_compressed_representation_cannot_keep_deleted_events(self):
+        payload = self.log('a', 'a.jsonl', count=2)
+        self.registry.register(payload)
+        self.registry.snapshot('a')
+        rows = Path(payload['transcript_path']).read_bytes().splitlines(keepends=True)
+        target = self.move(payload, compressed=True)
+        target.write_bytes(compress(b''.join(rows[:-1])))
+        with self.assertRaises(ValueError):
+            self.registry.snapshot('a')
+
+    def test_failed_detail_does_not_reset_compressed_progress(self):
+        payload = self.log('a', 'a.jsonl')
+        self.registry.register(payload)
+        self.move(payload, compressed=True)
+        self.registry.snapshot('a')
+        reader = self.registry.readers['a'][0]
+        done = dict(reader.compressed_done)
+        with patch.object(reader, 'full_event', side_effect=ValueError('bad detail')):
+            with self.assertRaises(ValueError):
+                self.registry.snapshot('a', detail='bad')
+        self.assertEqual(reader.compressed_done, done)
+
+    def test_skippable_frames_have_a_raw_input_budget(self):
+        import io, struct
+        from src.trace_viewer.sources import decoder
+        if compress is None:
+            self.skipTest('Zstandard decoder not installed')
+        frame = struct.pack('<II', 0x184D2A50, 4096) + b'x'*4096
+        with patch('src.trace_viewer.sources.INPUT_BUDGET', 1024):
+            stream = decoder(io.BytesIO(frame+compress(b'hello')))
+            try:
+                with self.assertRaises(ValueError):
+                    stream.read(1)
+            finally:
+                stream.close()
+
 
 if __name__ == '__main__':
     unittest.main()

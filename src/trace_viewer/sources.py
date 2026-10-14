@@ -3,9 +3,34 @@ import json
 import os
 from pathlib import Path
 import stat
+import time
 
 HEADER_LIMIT = 8 * 1024 * 1024
 DETAIL_SCAN_LIMIT = 16 * 1024 * 1024
+INPUT_BUDGET = 16 * 1024 * 1024
+
+
+class BudgetInput:
+    def __init__(self, raw):
+        self.raw = raw
+        self.reset()
+
+    def reset(self):
+        self.remaining = INPUT_BUDGET
+        self.deadline = time.monotonic() + 2
+
+    def read(self, size=-1):
+        if self.remaining <= 0 or time.monotonic() > self.deadline:
+            raise ValueError('Compressed input exceeds the per-refresh safety budget')
+        data = self.raw.read(min(self.remaining, 65536 if size < 0 else size))
+        self.remaining -= len(data)
+        return data
+
+    def tell(self):
+        return self.raw.tell()
+
+    def seekable(self):
+        return False
 
 
 class SourcePending(Exception):
@@ -71,12 +96,16 @@ def decoder(raw):
             from backports import zstd
         except ImportError:
             raise ValueError('Compressed history requires Python 3.14+ or the backports.zstd package') from None
-    return CheckedDecoder(zstd.ZstdFile(raw, options={zstd.DecompressionParameter.window_log_max: 23}), zstd.ZstdError)
+    budget = BudgetInput(raw)
+    return CheckedDecoder(zstd.ZstdFile(budget, options={zstd.DecompressionParameter.window_log_max: 23}), zstd.ZstdError, budget)
 
 
 class CheckedDecoder:
-    def __init__(self, stream, error):
-        self.stream, self.error = stream, error
+    def __init__(self, stream, error, budget):
+        self.stream, self.error, self.budget = stream, error, budget
+
+    def reset_budget(self):
+        self.budget.reset()
 
     def read(self, size):
         try:

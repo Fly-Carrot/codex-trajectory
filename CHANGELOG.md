@@ -18,6 +18,9 @@
   compressed details have a scan limit; summaries remain browsable.
 - Add migration, restart, bounded-progress, multi-frame, Unicode, corruption,
   source-identity and symlink regression tests, plus Python 3.14 CI coverage.
+- Preserve indexed-record proofs across representation changes, reject removed
+  or altered records, cap compressed input as well as output, and keep completed
+  indexing state intact when a read-only detail request fails.
 
 ## 0.2.1 - 2026-10-06
 

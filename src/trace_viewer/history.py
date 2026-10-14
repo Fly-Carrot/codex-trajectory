@@ -88,6 +88,8 @@ class HistoryReader:
                 CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY, stamp TEXT, turn TEXT,
                     summary TEXT, refs TEXT);
                 CREATE INDEX IF NOT EXISTS event_order ON events(stamp,id);
+                CREATE TABLE IF NOT EXISTS record_proofs(path TEXT, offset INTEGER,
+                    length INTEGER, digest TEXT, PRIMARY KEY(path,offset));
                 CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value INTEGER);
                 INSERT OR IGNORE INTO metadata VALUES('version',0);
             ''')
@@ -99,7 +101,12 @@ class HistoryReader:
                 # cache once; source transcripts are never modified.
                 db.execute('DELETE FROM events')
                 db.execute('DELETE FROM sources')
+                db.execute('DELETE FROM record_proofs')
                 db.execute("INSERT OR REPLACE INTO metadata VALUES('format',2)")
+            if not db.execute("SELECT value FROM metadata WHERE key='proofs'").fetchone():
+                for row in db.execute('SELECT refs FROM events'):
+                    db.executemany('INSERT OR IGNORE INTO record_proofs VALUES(?,?,?,?)', json.loads(row['refs']))
+                db.execute("INSERT INTO metadata VALUES('proofs',1)")
         self.initialized = True
 
     @contextmanager
@@ -146,6 +153,7 @@ class HistoryReader:
                 else:
                     existing.close()
             self.compressed_source = (path, source)
+            source.stream.reset_budget()
         with (nullcontext() if compressed else source):
             stream = source.stream
             old = db.execute('SELECT * FROM sources WHERE path=?', (path,)).fetchone()
@@ -202,6 +210,10 @@ class HistoryReader:
                         raise ValueError('Compressed source has an incomplete final record')
                     stream.seek(offset)
                     break
+                digest = hashlib.sha256(raw).hexdigest()
+                proof = db.execute('SELECT length,digest FROM record_proofs WHERE path=? AND offset=?', (path, offset)).fetchone()
+                if proof and (proof['length'] != len(raw) or proof['digest'] != digest):
+                    raise ValueError('Indexed source record changed; history index needs explicit rebuild')
                 try:
                     record = json.loads(raw)
                     payload = record.get('payload', {})
@@ -215,7 +227,8 @@ class HistoryReader:
                     if not event:
                         continue
                     event['turn_id'] = event['turn_id'] or turn
-                    ref = [path, offset, len(raw), hashlib.sha256(raw).hexdigest()]
+                    ref = [path, offset, len(raw), digest]
+                    db.execute('INSERT OR IGNORE INTO record_proofs VALUES(?,?,?,?)', ref)
                     previous = db.execute('SELECT summary,refs FROM events WHERE id=?', (event['id'],)).fetchone()
                     refs = json.loads(previous['refs']) if previous else []
                     if not any(r[0:2] == ref[0:2] for r in refs):
@@ -240,6 +253,9 @@ class HistoryReader:
                 except (ValueError, TypeError, AttributeError):
                     skipped += 1
             finish = stream.tell()
+            if compressed and eof and db.execute('SELECT 1 FROM record_proofs WHERE path=? AND offset>=? LIMIT 1',
+                                                 (path, finish)).fetchone():
+                raise ValueError('Compressed representation lost indexed records; history index needs explicit rebuild')
             db.execute('INSERT OR REPLACE INTO sources VALUES(?,?,?,?,?,?,?)',
                        (path, identity, 0 if compressed else ((start if begin >= end else begin) if not old or backward else old['start']),
                         old['offset'] if old and backward else finish,
@@ -302,8 +318,9 @@ class HistoryReader:
                 self.capacity_limit_hit = None
                 return result
             except sqlite3.OperationalError as exc:
-                self.close()
-                self.compressed_done.clear()
+                if not detail:
+                    self.close()
+                    self.compressed_done.clear()
                 # Python 3.10 lacks sqlite_errorcode; keep its exact FULL message fallback.
                 if (getattr(exc, 'sqlite_errorcode', None) != 13
                         and str(exc) != 'database or disk is full'):
@@ -314,8 +331,9 @@ class HistoryReader:
                 # snapshot rather than deleting active history or growing forever.
                 return self._snapshot(before, detail, anchor, capacity_limited=True)
             except Exception:
-                self.close()
-                self.compressed_done.clear()
+                if not detail:
+                    self.close()
+                    self.compressed_done.clear()
                 raise
 
     def _snapshot(self, before=None, detail=None, anchor=None, capacity_limited=False):
