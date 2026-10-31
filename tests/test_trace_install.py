@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from src.trace_viewer.install import configure, BEGIN, END, strip_rule
 
@@ -25,6 +26,20 @@ class InstallTests(unittest.TestCase):
         before = {p.name:p.read_bytes() for p in self.home.iterdir()}
         configure(self.home, dry_run=True)
         self.assertEqual(before, {p.name:p.read_bytes() for p in self.home.iterdir()})
+
+    def test_user_only_decoder_rejected_before_install_writes(self):
+        before = {p.name:p.read_bytes() for p in self.home.iterdir()}
+        with patch('importlib.util.find_spec', return_value=object()), \
+             patch('subprocess.run', return_value=subprocess.CompletedProcess([], 1)):
+            with self.assertRaisesRegex(ValueError, 'virtual environment'):
+                configure(self.home)
+        self.assertEqual(before, {p.name:p.read_bytes() for p in self.home.iterdir()})
+
+    def test_optional_missing_decoder_is_reported_in_dry_run(self):
+        with patch('importlib.util.find_spec', return_value=None), \
+             patch('subprocess.run', return_value=subprocess.CompletedProcess([], 1)):
+            result = configure(self.home, dry_run=True)
+        self.assertEqual(result['compressed_history'], 'unavailable; plain JSONL only')
 
     def test_session_start_upgrade_preserves_custom_hook_and_removes_owned_on_uninstall(self):
         custom = {'matcher': 'resume', 'hooks': [{'type': 'command', 'command': 'echo custom'}]}

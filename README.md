@@ -38,8 +38,21 @@ supported rollout logs. Windows is not supported (POSIX file locking).
 Node is only used by JavaScript regression tests, not by the viewer.
 
 For compressed Codex history (`.jsonl.zst`), use **Python 3.14+** (built-in
-decoder). On Python 3.10-3.13, install `backports.zstd` in the same environment
-used to run the installer: `python3 -m pip install backports.zstd`.
+decoder). On Python 3.10-3.13, use a dedicated virtual environment:
+
+```sh
+python3 -m venv ~/.local/share/codex-trajectory-venv
+~/.local/share/codex-trajectory-venv/bin/python -m pip install backports.zstd
+# After cloning, run install.py with this same environment's Python.
+~/.local/share/codex-trajectory-venv/bin/python install.py --dry-run
+~/.local/share/codex-trajectory-venv/bin/python install.py
+```
+
+Keep that environment after installation. The service uses isolated Python
+(`-I`), so `pip --user` and `PYTHONPATH` dependencies are not available to it.
+Installation checks decoder visibility before changing files and reports whether
+compressed history is available. Do not switch interpreters between dry-run and
+installation. The generic commands below assume your chosen `python3` is suitable.
 Plain JSONL viewing does not require this optional package.
 See [segment recovery and limits](docs/segment-recovery.md) for archive handling,
 resource bounds, and the upstream projects informing the fix.

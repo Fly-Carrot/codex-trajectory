@@ -26,6 +26,10 @@
 - Add isolated regression tests for service restart, expired tokens, occupied
   ports, simultaneous chat recovery and persistent indexing. Existing source
   logs remain read-only; installations are not restarted by this release.
+- Retry a partially written UTF-8 header without accepting malformed encodings.
+  Check isolated-interpreter decoder availability before installation and document
+  a virtual-environment setup for Python 3.10-3.13; user-only dependencies cannot
+  silently break the background service after upgrade.
 
 ## 0.2.2 - 2026-10-14
 

@@ -66,7 +66,7 @@ class LauncherTests(unittest.TestCase):
 
     def test_hook_retries_missing_or_partial_exact_transcript(self):
         original = self.log.read_bytes()
-        for partial in (None, b'{"type":'):
+        for partial in (None, b'{"type":', b'{"cwd":"' + chr(0x4e2d).encode('utf-8')[:2]):
             with self.subTest(partial=partial):
                 if partial is None:
                     self.log.unlink(missing_ok=True)
@@ -78,6 +78,15 @@ class LauncherTests(unittest.TestCase):
                 self.assertEqual(result['url'], 'verified')
                 sleep.assert_called_once()
                 self.assertEqual(launch.call_args.args[0], self.payload)
+
+    def test_invalid_utf8_is_not_treated_as_pending(self):
+        for content in (b'{"cwd":"\xff', b'{"cwd":"\xe4\xb8\n'):
+            self.log.write_bytes(content)
+            with patch.object(launcher.time, 'sleep') as sleep, patch.object(launcher, 'launch') as launch:
+                with self.assertRaises(UnicodeDecodeError):
+                    launcher.launch_hook(self.payload, self.root/'state', self.sessions)
+                sleep.assert_not_called()
+                launch.assert_not_called()
 
     def test_hook_retry_is_bounded_and_does_not_retry_identity_errors(self):
         self.log.unlink()

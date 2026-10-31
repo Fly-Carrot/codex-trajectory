@@ -150,6 +150,12 @@ class Source:
                 raise ValueError('Source header exceeds limit')
             try:
                 header = json.loads(raw_header)
+            except UnicodeDecodeError as exc:
+                if (not self.compressed and not raw_header.endswith(b'\n')
+                        and exc.encoding == 'utf-8' and exc.reason == 'unexpected end of data'
+                        and exc.end == len(raw_header)):
+                    raise TranscriptNotReady('Source header pending') from None
+                raise
             except json.JSONDecodeError:
                 if not self.compressed and not raw_header.endswith(b'\n'):
                     raise TranscriptNotReady('Source header pending') from None
