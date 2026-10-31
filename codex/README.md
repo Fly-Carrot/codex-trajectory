@@ -5,7 +5,7 @@
 [![Tests](https://github.com/Fly-Carrot/codex-trajectory/actions/workflows/tests.yml/badge.svg)](https://github.com/Fly-Carrot/codex-trajectory/actions/workflows/tests.yml)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-7cafd0)
 ![Local only](https://img.shields.io/badge/runtime-local%20only-7faf91)
-[![MIT](https://img.shields.io/badge/license-MIT-a182bd)](LICENSE)
+[![MIT](https://img.shields.io/badge/license-MIT-a182bd)](../LICENSE)
 
 See public messages, commands, file changes, MCP calls, agent operations and tool
 outputs as they arrive. One shared local process. No additional model calls.
@@ -33,6 +33,8 @@ No API key. No KnowledgeOS dependency.
 
 ## Quick start
 
+This folder is the Codex observer in the [trajectory](../README.md) repository. Run the commands below from this folder (`cd codex` after cloning).
+
 Requires **Python 3.10+**, macOS or Linux, and a local Codex client that writes
 supported rollout logs. Windows is not supported (POSIX file locking).
 Node is only used by JavaScript regression tests, not by the viewer.
@@ -58,8 +60,8 @@ See [segment recovery and limits](docs/segment-recovery.md) for archive handling
 resource bounds, and the upstream projects informing the fix.
 
 ```sh
-git clone https://github.com/Fly-Carrot/codex-trajectory.git
-cd codex-trajectory
+git clone https://github.com/Fly-Carrot/codex-trajectory.git trajectory
+cd trajectory/codex
 python3 install.py --dry-run
 python3 install.py
 ```
@@ -318,4 +320,4 @@ Independent implementation; no affiliation with OpenAI or DeepSeek. A Codex plug
 could later distribute this same observer, but it is not an agent Skill or MCP
 server and does not require either to run.
 
-See [CHANGELOG.md](CHANGELOG.md) and [SECURITY.md](SECURITY.md).
+See [CHANGELOG.md](CHANGELOG.md), [SECURITY.md](SECURITY.md) and the [licence](../LICENSE).

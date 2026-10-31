@@ -5,10 +5,15 @@ permissions:
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
+        component: [codex, claude]
         os: [ubuntu-latest, macos-latest]
-        python: ['3.10', '3.13', '3.14']
+        python: ['3.10', '3.12', '3.13', '3.14']
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.component }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -18,5 +23,5 @@ jobs:
         with:
           node-version: '22'
       - run: python -m pip install backports.zstd
-        if: matrix.python != '3.14'
+        if: matrix.component == 'codex' && matrix.python != '3.14'
       - run: python -B -m unittest discover -s tests -v

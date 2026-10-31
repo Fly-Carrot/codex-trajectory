@@ -2,7 +2,7 @@
 
 **A quiet, live timeline for your Claude Code sessions.**
 
-A read-only observer adapted from [codex-trajectory](https://github.com/Fly-Carrot/codex-trajectory).
+A read-only observer adapted from [codex-trajectory](../codex/README.md).
 It reads the transcripts Claude Code already writes and shows public messages,
 commands, file operations, MCP calls, subagents and tool results as they arrive.
 One shared local process. No additional model calls. No API key. Not a harness:
@@ -28,6 +28,8 @@ See [docs/event-source-map.md](docs/event-source-map.md) for exactly which recor
 feed each row and which parts of the format are documented versus only observed.
 
 ## Requirements
+
+This folder is the Claude Code observer in the [trajectory](../README.md) repository. Run the commands below from this folder (`cd claude` after cloning).
 
 Python 3.10+ (tested on 3.12 and 3.14), macOS or Linux, Claude Code that writes
 JSONL transcripts under `~/.claude/projects` (verified with **2.1.185**). Standard
@@ -241,4 +243,4 @@ Adapted from [codex-trajectory](https://github.com/Fly-Carrot/codex-trajectory)
 redaction and recovery design are reused; session identity, transcript parsing and
 installation are new. Independent project; no affiliation with Anthropic or OpenAI.
 
-See [CHANGELOG.md](CHANGELOG.md) and [SECURITY.md](SECURITY.md).
+See [CHANGELOG.md](CHANGELOG.md), [SECURITY.md](SECURITY.md) and the [licence](../LICENSE).
