@@ -18,8 +18,10 @@ from urllib.request import Request, build_opener, HTTPRedirectHandler, ProxyHand
 
 try:
     from .broker import resolve_session, private_directory, read_private, write_private, SERVICE_SCHEMA
+    from .sources import TranscriptNotReady
 except ImportError:
     from broker import resolve_session, private_directory, read_private, write_private, SERVICE_SCHEMA
+    from sources import TranscriptNotReady
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_STATE = ROOT / '.knowledgeos-local/trace-viewer/shared'
@@ -117,7 +119,7 @@ def launch(payload, state=DEFAULT_STATE, sessions=None, auto_open=False, opener=
         service = service_health(state, sessions)
         reused = service is not None
         if service is None:
-            child = subprocess.Popen([sys.executable, '-B', str(Path(__file__).with_name('broker.py')),
+            child = subprocess.Popen([sys.executable, '-I', '-B', str(Path(__file__).with_name('broker.py')),
                                       '--sessions', str(sessions), '--state-dir', str(state)],
                                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
@@ -135,7 +137,10 @@ def launch(payload, state=DEFAULT_STATE, sessions=None, auto_open=False, opener=
                 raise RuntimeError('Viewer startup timed out')
             threading.Thread(target=child.wait, daemon=True).start()
         data = request(service['origin'], '/api/register', service['token'],
-                       {'hook_event_name': payload['hook_event_name'], 'session_id': thread, 'transcript_path': str(log)})
+                       # Registration RPC is not hook evidence. Use its existing
+                       # event contract so older live observers need no restart.
+                       {'hook_event_name': 'UserPromptSubmit' if payload['hook_event_name'] == 'SessionStart'
+                        else payload['hook_event_name'], 'session_id': thread, 'transcript_path': str(log)})
         connection = directory / 'connection.json'
         write_private(connection, data)
         if not healthy(connection, thread, log):
@@ -226,11 +231,27 @@ def current_link(state, thread):
     return {'status': 'available', 'thread_id': thread, 'url': data['url']}
 
 
+def launch_hook(payload, state=DEFAULT_STATE, sessions=None):
+    sessions = sessions or Path(os.environ.get('CODEX_HOME', Path.home() / '.codex')) / 'sessions'
+    if not isinstance(payload, dict) or not payload.get('transcript_path'):
+        raise ValueError('Transcript path not supplied')
+    # Retry source readiness only, never service mutations or failed safety checks.
+    for attempt in range(3):
+        try:
+            resolve_session(payload, sessions)
+            break
+        except (FileNotFoundError, TranscriptNotReady):
+            if attempt == 2:
+                raise
+            time.sleep(.15 * (attempt + 1))
+    return launch(payload, state=state, sessions=sessions, auto_open=False)
+
+
 def hook_response(payload, result):
     response = {'suppressOutput': True}
-    if payload.get('hook_event_name') == 'UserPromptSubmit' and result.get('url'):
+    if payload.get('hook_event_name') in ('UserPromptSubmit', 'SessionStart') and result.get('url'):
         response['hookSpecificOutput'] = {
-            'hookEventName': 'UserPromptSubmit',
+            'hookEventName': payload['hook_event_name'],
             'additionalContext': 'codex-trajectory verified this exact chat. Append this single link at the end of your final reply: '
                                  '[Trajectory](' + result['url'] + '). Do not open a tab automatically. '
                                  'This private local link must not appear in public files. Observer failures must not block work.'}
@@ -264,7 +285,8 @@ def main():
             payload = json.loads(sys.stdin.read(1024 * 1024)) if args.hook else {
                 'hook_event_name': 'UserPromptSubmit', 'session_id': args.thread_id,
                 'transcript_path': str(args.log or '')}
-            result = launch(payload, state=args.state_dir, auto_open=args.auto_open)
+            result = (launch_hook(payload, state=args.state_dir) if args.hook else
+                      launch(payload, state=args.state_dir, auto_open=args.auto_open))
         print(json.dumps(hook_response(payload, result) if args.hook else result))
     except Exception as exc:
         if args.hook:

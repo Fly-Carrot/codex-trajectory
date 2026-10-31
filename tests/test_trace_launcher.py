@@ -33,6 +33,104 @@ class LauncherTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 launcher.resolve_session({**self.payload, **changes}, self.sessions)
 
+    def test_session_start_sources_register_and_inject_matching_context(self):
+        state = self.root / 'state'
+        first = None
+        for source in ('startup', 'resume', 'fork', 'compact', 'clear'):
+            payload = {**self.payload, 'hook_event_name': 'SessionStart', 'source': source}
+            with self.subTest(source=source):
+                result = launcher.launch(payload, state, self.sessions)
+                if first is None:
+                    first = result
+                    self.addCleanup(lambda: os.kill(first['pid'], signal.SIGTERM))
+                self.assertEqual(result['url'], first['url'])
+                self.assertEqual(result['pid'], first['pid'])
+                response = launcher.hook_response(payload, result)['hookSpecificOutput']
+                self.assertEqual(response['hookEventName'], 'SessionStart')
+                self.assertIn(result['url'], response['additionalContext'])
+        self.assertIsNotNone(first)
+        again = launcher.launch({**self.payload, 'hook_event_name': 'UserPromptSubmit'}, state, self.sessions)
+        self.assertEqual(again['url'], first['url'])
+
+    def test_startup_reuses_older_observer_registration_protocol(self):
+        real_request = launcher.request
+        def old_request(origin, path, token=None, body=None):
+            if path == '/api/register':
+                self.assertEqual(body['hook_event_name'], 'UserPromptSubmit')
+            return real_request(origin, path, token, body)
+        payload = {**self.payload, 'hook_event_name': 'SessionStart'}
+        with patch.object(launcher, 'request', side_effect=old_request):
+            result = launcher.launch(payload, self.root/'state', self.sessions)
+        self.addCleanup(lambda: os.kill(result['pid'], signal.SIGTERM))
+        self.assertEqual(launcher.hook_response(payload, result)['hookSpecificOutput']['hookEventName'], 'SessionStart')
+
+    def test_hook_retries_missing_or_partial_exact_transcript(self):
+        original = self.log.read_bytes()
+        for partial in (None, b'{"type":'):
+            with self.subTest(partial=partial):
+                if partial is None:
+                    self.log.unlink(missing_ok=True)
+                else:
+                    self.log.write_bytes(partial)
+                with patch.object(launcher.time, 'sleep', side_effect=lambda _: self.log.write_bytes(original)) as sleep, \
+                     patch.object(launcher, 'launch', return_value={'url': 'verified'}) as launch:
+                    result = launcher.launch_hook(self.payload, self.root/'state', self.sessions)
+                self.assertEqual(result['url'], 'verified')
+                sleep.assert_called_once()
+                self.assertEqual(launch.call_args.args[0], self.payload)
+
+    def test_hook_retry_is_bounded_and_does_not_retry_identity_errors(self):
+        self.log.unlink()
+        with patch.object(launcher.time, 'sleep') as sleep, patch.object(launcher, 'launch') as launch:
+            with self.assertRaises(FileNotFoundError):
+                launcher.launch_hook(self.payload, self.root/'state', self.sessions)
+            self.assertEqual(sleep.call_count, 2)
+            launch.assert_not_called()
+        self.log.write_text(json.dumps({'type': 'session_meta', 'payload': {'id': 'other'}})+'\n')
+        with patch.object(launcher.time, 'sleep') as sleep, patch.object(launcher, 'launch') as launch:
+            with self.assertRaises(ValueError):
+                launcher.launch_hook(self.payload, self.root/'state', self.sessions)
+            sleep.assert_not_called()
+            launch.assert_not_called()
+
+    def test_null_transcript_defers_without_starting_service_or_scanning(self):
+        with patch.object(launcher.time, 'sleep') as sleep, patch.object(launcher, 'launch') as launch:
+            with self.assertRaises(ValueError):
+                launcher.launch_hook({**self.payload, 'transcript_path': None}, self.root/'state', self.sessions)
+            sleep.assert_not_called()
+            launch.assert_not_called()
+
+    def test_agent_created_main_chat_registration_history_and_resume(self):
+        self.log.write_text(json.dumps({'type': 'session_meta', 'payload': {
+            'id': 'thread-test', 'source': 'vscode',
+            'thread_source': 'agent_created_thread'}}) + '\n' + json.dumps({
+                'type': 'response_item', 'payload': {'type': 'message',
+                'id': 'public-message', 'role': 'user', 'content': 'hello'}}) + '\n')
+        payload = {**self.payload, 'hook_event_name': 'UserPromptSubmit'}
+        self.assertEqual(launcher.resolve_session(payload, self.sessions)[0], 'thread-test')
+        state = self.root / 'state'
+        registry = Registry(state, self.sessions)
+        registry.register(payload)
+        self.assertEqual(len(registry.snapshot('thread-test')['events']), 1)
+        with patch.object(launcher, 'launch', return_value={'url': 'verified'}):
+            self.assertEqual(launcher.resume(state, 'thread-test', self.sessions)['url'], 'verified')
+        response = launcher.hook_response(payload, {'url': 'verified'})
+        self.assertIn('verified', response['hookSpecificOutput']['additionalContext'])
+
+    def test_agent_created_label_does_not_override_subagent_or_identity_guards(self):
+        for source in ('exec', 'subagent', {'subagent': 'worker'}):
+            with self.subTest(source=source):
+                self.log.write_text(json.dumps({'type': 'session_meta', 'payload': {
+                    'id': 'thread-test', 'source': source,
+                    'thread_source': 'agent_created_thread'}}) + '\n')
+                with self.assertRaisesRegex(ValueError, 'Not a main chat'):
+                    launcher.resolve_session(self.payload, self.sessions)
+        self.log.write_text(json.dumps({'type': 'session_meta', 'payload': {
+            'id': 'another', 'source': 'vscode',
+            'thread_source': 'agent_created_thread'}}) + '\n')
+        with self.assertRaisesRegex(ValueError, 'Wrong source thread'):
+            launcher.resolve_session(self.payload, self.sessions)
+
     def registered_state(self):
         state = self.root / 'state'
         state.mkdir(mode=0o700)

@@ -26,13 +26,27 @@ class InstallTests(unittest.TestCase):
         configure(self.home, dry_run=True)
         self.assertEqual(before, {p.name:p.read_bytes() for p in self.home.iterdir()})
 
+    def test_session_start_upgrade_preserves_custom_hook_and_removes_owned_on_uninstall(self):
+        custom = {'matcher': 'resume', 'hooks': [{'type': 'command', 'command': 'echo custom'}]}
+        self.hooks['hooks']['SessionStart'] = [custom]
+        (self.home/'hooks.json').write_text(json.dumps(self.hooks))
+        configure(self.home)
+        configure(self.home)
+        groups = json.loads((self.home/'hooks.json').read_text())['hooks']['SessionStart']
+        self.assertEqual(groups[0], custom)
+        self.assertEqual(len(groups), 2)
+        self.assertNotIn('matcher', groups[1])
+        self.assertIn('--hook', groups[1]['hooks'][0]['command'])
+        configure(self.home, uninstall=True)
+        self.assertEqual(json.loads((self.home/'hooks.json').read_text())['hooks']['SessionStart'], [custom])
+
     def test_installed_hook_registers_exact_chat_and_returns_nonblocking_link(self):
         configure(self.home)
         sessions = self.home/'sessions'
         sessions.mkdir()
         log = sessions/'synthetic.jsonl'
         log.write_text(json.dumps({'type':'session_meta', 'payload':{'id':'install-smoke'}})+'\n')
-        payload = {'hook_event_name':'UserPromptSubmit','session_id':'install-smoke',
+        payload = {'hook_event_name':'SessionStart','session_id':'install-smoke',
                    'transcript_path':str(log), 'prompt':'not forwarded '*1000}
         command = [sys.executable, str(self.home/'codex-trajectory/codex-trajectory'), '--hook']
         result = subprocess.run(command, input=json.dumps(payload), capture_output=True, text=True, check=True, timeout=12)
@@ -40,9 +54,27 @@ class InstallTests(unittest.TestCase):
         self.addCleanup(lambda: os.kill(connection['pid'], signal.SIGTERM))
         response = json.loads(result.stdout)
         self.assertNotIn('decision', response)
+        self.assertEqual(response['hookSpecificOutput']['hookEventName'], 'SessionStart')
         self.assertIn(connection['url'], response['hookSpecificOutput']['additionalContext'])
+        payload['hook_event_name'] = 'UserPromptSubmit'
+        result = subprocess.run(command, input=json.dumps(payload), capture_output=True, text=True, check=True, timeout=12)
+        self.assertIn(connection['url'], json.loads(result.stdout)['hookSpecificOutput']['additionalContext'])
+        reused = json.loads((self.home/'codex-trajectory/runtime/install-smoke/connection.json').read_text())
+        for key in ('url', 'pid', 'thread_id', 'instance', 'log'):
+            self.assertEqual(connection[key], reused[key])
+        self.assertTrue(connection['registered'])
+        self.assertFalse(reused['registered'])
         result = subprocess.run(command, input='malformed', capture_output=True, text=True, check=True, timeout=12)
         self.assertEqual(json.loads(result.stdout), {'suppressOutput':True})
+
+    def test_installed_start_hook_with_null_transcript_is_nonblocking(self):
+        configure(self.home)
+        payload = {'hook_event_name': 'SessionStart', 'session_id': 'no-file', 'transcript_path': None}
+        result = subprocess.run([sys.executable, str(self.home/'codex-trajectory/codex-trajectory'), '--hook'],
+                                input=json.dumps(payload), capture_output=True, text=True, timeout=3)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stdout), {'suppressOutput': True})
+        self.assertFalse((self.home/'codex-trajectory/runtime').exists())
 
     def test_install_idempotent_preserves_other_hooks_and_rules(self):
         configure(self.home)

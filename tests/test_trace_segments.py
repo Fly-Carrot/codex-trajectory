@@ -1,8 +1,10 @@
 import json
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 import sqlite3
+import os
+from contextlib import contextmanager
 
 import test_trace_history as fixtures
 from src.trace_viewer.broker import Registry
@@ -23,6 +25,133 @@ except ImportError:
 class SegmentTests(unittest.TestCase):
     setUp = fixtures.HistoryTests.setUp
     log = fixtures.HistoryTests.log
+
+    def device_change(self, count=1):
+        payload = self.log('a', 'device.jsonl', count=count)
+        self.registry.register(payload)
+        before = self.registry.snapshot('a')
+        reader = self.registry.readers['a'][0]
+        with reader.connect() as db:
+            row = db.execute('SELECT identity FROM sources').fetchone()
+            device, inode = row['identity'].split(':')
+            db.execute('UPDATE sources SET identity=?', (f'{int(device)+1}:{inode}',))
+        restored = Registry(self.root/'state', self.sessions)
+        return payload, before, restored
+
+    def test_restart_device_change_revalidates_identical_records(self):
+        payload, before, restored = self.device_change(3)
+        original = Path(payload['transcript_path']).read_bytes()
+        after = restored.snapshot('a')
+        self.assertEqual(before['events'], after['events'])
+        self.assertFalse(after['indexing'])
+        self.assertEqual(original, Path(payload['transcript_path']).read_bytes())
+
+    def test_device_change_revalidation_is_bounded(self):
+        _, before, restored = self.device_change(50)
+        with patch('src.trace_viewer.history.WINDOW', 512):
+            after = restored.snapshot('a')
+            self.assertTrue(after['indexing'])
+            for _ in range(100):
+                after = restored.snapshot('a')
+                if not after['indexing']:
+                    break
+        self.assertFalse(after['indexing'])
+        self.assertEqual(before['events'], after['events'])
+
+    def test_device_change_rejects_modified_proof(self):
+        payload, _, restored = self.device_change()
+        path = Path(payload['transcript_path'])
+        path.write_bytes(path.read_bytes().replace(b'message-0', b'changed-0'))
+        with self.assertRaisesRegex(ValueError, 'record changed'):
+            restored.snapshot('a')
+
+    def test_device_change_rejects_truncation(self):
+        payload, _, restored = self.device_change(3)
+        path = Path(payload['transcript_path'])
+        path.write_bytes(path.read_bytes().splitlines(keepends=True)[0])
+        with self.assertRaisesRegex(ValueError, 'truncated'):
+            restored.snapshot('a')
+
+    def test_device_change_rejects_wrong_chat(self):
+        payload, _, restored = self.device_change()
+        path = Path(payload['transcript_path'])
+        path.write_bytes(path.read_bytes().replace(b'"id": "a"', b'"id": "b"'))
+        with self.assertRaisesRegex(ValueError, 'Wrong source thread'):
+            restored.snapshot('a')
+
+    def test_device_change_does_not_accept_new_inode(self):
+        payload, _, restored = self.device_change()
+        path = Path(payload['transcript_path'])
+        replacement = path.with_suffix('.new')
+        replacement.write_bytes(path.read_bytes())
+        replacement.replace(path)
+        with self.assertRaisesRegex(ValueError, 'replaced'):
+            restored.snapshot('a')
+
+    def test_device_validation_restarts_when_source_changes(self):
+        payload, _, restored = self.device_change(50)
+        with patch('src.trace_viewer.history.WINDOW', 512):
+            self.assertTrue(restored.snapshot('a')['indexing'])
+            path = Path(payload['transcript_path'])
+            path.write_bytes(path.read_bytes().replace(b'message-0', b'changed-0'))
+            with self.assertRaisesRegex(ValueError, 'record changed'):
+                restored.snapshot('a')
+
+    def test_device_change_still_reads_appended_events(self):
+        payload, _, restored = self.device_change()
+        path = Path(payload['transcript_path'])
+        row = {'type': 'response_item', 'timestamp': '2026-10-03T01:00:00Z',
+               'payload': {'type': 'message', 'id': 'new', 'role': 'user', 'content': 'new'}}
+        with path.open('a') as stream:
+            stream.write(json.dumps(row)+'\n')
+        snap = restored.snapshot('a')
+        self.assertEqual({e['detail'] for e in snap['events']}, {'message-0', 'new'})
+        self.assertFalse(snap['indexing'])
+
+    def test_device_change_validates_391_small_records_with_append(self):
+        payload, _, restored = self.device_change(391)
+        path = Path(payload['transcript_path'])
+        with path.open('a') as stream:
+            stream.write(json.dumps({'type': 'padding', 'payload': {}})+'\n')
+        self.assertFalse(restored.snapshot('a')['indexing'])
+
+    def test_device_validation_warns_until_quiet_scan_finishes(self):
+        payload, _, restored = self.device_change(50)
+        path = Path(payload['transcript_path'])
+        with patch('src.trace_viewer.history.WINDOW', 512):
+            for _ in range(3):
+                with path.open('a') as stream:
+                    stream.write(json.dumps({'type': 'padding', 'payload': {}})+'\n')
+                snap = restored.snapshot('a')
+                self.assertTrue(snap['indexing'])
+                self.assertTrue(any('not yet reverified' in w for w in snap['warnings']))
+            for _ in range(100):
+                snap = restored.snapshot('a')
+                if not snap['indexing']:
+                    break
+        self.assertFalse(snap['indexing'])
+        self.assertFalse(snap['warnings'])
+
+    def test_append_during_device_validation_keeps_warning(self):
+        payload, _, restored = self.device_change()
+        from src.trace_viewer.history import HistoryReader
+        original = HistoryReader.revalidate_device
+        def validate(reader, db, path, source, old):
+            stream = source.stream
+            def read(size):
+                data = stream.read(size)
+                with Path(payload['transcript_path']).open('a') as writer:
+                    writer.write(json.dumps({'type': 'padding', 'payload': {}})+'\n')
+                return data
+            source.stream = Mock(wraps=stream)
+            source.stream.read.side_effect = read
+            return original(reader, db, path, source, old)
+        with patch.object(HistoryReader, 'revalidate_device', validate):
+            snap = restored.snapshot('a')
+        self.assertTrue(snap['indexing'])
+        self.assertTrue(any('not yet reverified' in w for w in snap['warnings']))
+        self.assertFalse(restored.snapshot('a')['warnings'])
+
     def move(self, payload, archive=False, compressed=False):
         path = Path(payload['transcript_path'])
         target = path
@@ -90,6 +219,118 @@ class SegmentTests(unittest.TestCase):
         with patch.object(launcher, 'launch', return_value={'url':'verified'}) as launch:
             self.assertEqual(launcher.resume(self.root/'state', 'a', self.sessions)['url'], 'verified')
             self.assertFalse(launch.call_args.kwargs['auto_open'])
+
+    def test_completed_compressed_history_does_not_replay_after_restart(self):
+        payload = self.log('a', 'completed.jsonl', count=80)
+        self.move(payload, compressed=True)
+        self.registry.register(payload)
+        with patch('src.trace_viewer.history.WINDOW', 512):
+            for _ in range(100):
+                before = self.registry.snapshot('a')
+                if not before['indexing']:
+                    break
+        self.assertFalse(before['indexing'])
+        restored = Registry(self.root/'state', self.sessions)
+        with patch.object(Source, 'advance', side_effect=AssertionError('completed source replayed')):
+            after = restored.snapshot('a')
+        self.assertFalse(after['indexing'])
+        self.assertEqual(before['events'], after['events'])
+
+    def test_incomplete_compressed_history_is_not_marked_completed(self):
+        payload = self.log('a', 'incomplete.jsonl', count=80)
+        self.move(payload, compressed=True)
+        self.registry.register(payload)
+        with patch('src.trace_viewer.history.WINDOW', 512):
+            self.assertTrue(self.registry.snapshot('a')['indexing'])
+            restored = Registry(self.root/'state', self.sessions)
+            self.assertTrue(restored.snapshot('a')['indexing'])
+
+    def test_completed_compressed_marker_invalidates_on_replacement(self):
+        payload = self.log('a', 'changed.jsonl')
+        path = self.move(payload, compressed=True)
+        self.registry.register(payload)
+        self.assertFalse(self.registry.snapshot('a')['indexing'])
+        source = self.log('a', 'replacement.jsonl', prefix='altered')
+        data = Path(source['transcript_path']).read_bytes()
+        path.write_bytes(compress(data))
+        restored = Registry(self.root/'state', self.sessions)
+        with self.assertRaises(ValueError):
+            restored.snapshot('a')
+
+    def test_completed_compressed_marker_invalidates_on_ctime_only_change(self):
+        payload = self.log('a', 'ctime.jsonl')
+        raw = Path(payload['transcript_path']).read_bytes()
+        path = self.move(payload, compressed=True)
+        def fixed_size(data):
+            padding = 1024 - len(data) - 8
+            return data + b'\x50\x2a\x4d\x18' + padding.to_bytes(4, 'little') + b'\0' * padding
+        path.write_bytes(fixed_size(path.read_bytes()))
+        self.registry.register(payload)
+        self.assertFalse(self.registry.snapshot('a')['indexing'])
+        before = path.stat()
+        changed = fixed_size(compress(raw.replace(b'message-0', b'message-1')))
+        self.assertEqual(len(changed), before.st_size)
+        path.write_bytes(changed)
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        self.assertEqual(path.stat().st_ino, before.st_ino)
+        self.assertNotEqual(path.stat().st_ctime_ns, before.st_ctime_ns)
+        with self.assertRaisesRegex(ValueError, 'record changed'):
+            self.registry.snapshot('a')
+        restored = Registry(self.root/'state', self.sessions)
+        with self.assertRaisesRegex(ValueError, 'record changed'):
+            restored.snapshot('a')
+
+    def test_second_ctime_change_during_partial_rescan_rechecks_earlier_proofs(self):
+        payload = self.log('a', 'rescan.jsonl', count=80)
+        raw = Path(payload['transcript_path']).read_bytes()
+        path = self.move(payload, compressed=True)
+        def padded(data):
+            padding = 4096 - len(data) - 8
+            return data + b'\x50\x2a\x4d\x18' + padding.to_bytes(4, 'little') + b'\0' * padding
+        initial = padded(compress(raw))
+        path.write_bytes(initial)
+        self.registry.register(payload)
+        self.assertFalse(self.registry.snapshot('a')['indexing'])
+        info = path.stat()
+        path.write_bytes(initial)
+        os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns))
+        with patch('src.trace_viewer.history.WINDOW', 512):
+            self.assertTrue(self.registry.snapshot('a')['indexing'])
+            path.write_bytes(padded(compress(raw.replace(b'message-0', b'changed-0'))))
+            os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns))
+            restored = Registry(self.root/'state', self.sessions)
+            with self.assertRaisesRegex(ValueError, 'record changed'):
+                restored.snapshot('a')
+
+    def test_completed_marker_rolls_back_with_index_transaction(self):
+        payload = self.log('a', 'rollback.jsonl', count=80)
+        self.move(payload, compressed=True)
+        self.registry.register(payload)
+        with patch('src.trace_viewer.history.WINDOW', 512):
+            self.assertTrue(self.registry.snapshot('a')['indexing'])
+        reader = self.registry.readers['a'][0]
+        connect = reader.connect
+        @contextmanager
+        def fail_commit():
+            with connect() as db:
+                yield db
+                raise RuntimeError('commit failed')
+        with patch.object(reader, 'connect', fail_commit):
+            with self.assertRaisesRegex(RuntimeError, 'commit failed'):
+                reader.snapshot()
+        with connect() as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM completed_sources').fetchone()[0], 0)
+        self.assertFalse(reader.compressed_done)
+        self.assertFalse(reader.snapshot()['indexing'])
+
+    def test_completed_marker_survives_reader_eviction(self):
+        payload = self.log('a', 'eviction.jsonl')
+        self.move(payload, compressed=True)
+        self.registry.register(payload)
+        self.assertFalse(self.registry.snapshot('a')['indexing'])
+        self.registry.readers.clear()
+        with patch.object(Source, 'advance', side_effect=AssertionError('eviction replayed source')):
+            self.assertFalse(self.registry.snapshot('a')['indexing'])
 
     def test_compressed_forward_scan_is_bounded_and_continues(self):
         payload = self.log('a', 'a.jsonl', count=200)

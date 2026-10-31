@@ -24,6 +24,10 @@ PAGE_EVENTS = 300
 PAGE_TURNS = 20
 
 
+def completion_fingerprint(path, info):
+    return source_identity(path, info) + ':' + str(info.st_ctime_ns)
+
+
 def record_order(record):
     stamp = record.get('timestamp', '')
     try:
@@ -73,6 +77,7 @@ class HistoryReader:
         self.initialized = False
         self.compressed_source = None
         self.compressed_done = {}
+        self.plain_validation = {}
         self.disk_limit_bytes = None
         self.capacity_limit_hit = None
         self.capacity_retry_at = 0
@@ -90,6 +95,10 @@ class HistoryReader:
                 CREATE INDEX IF NOT EXISTS event_order ON events(stamp,id);
                 CREATE TABLE IF NOT EXISTS record_proofs(path TEXT, offset INTEGER,
                     length INTEGER, digest TEXT, PRIMARY KEY(path,offset));
+                CREATE TABLE IF NOT EXISTS completed_sources(path TEXT PRIMARY KEY,
+                    identity TEXT, fingerprint TEXT, offset INTEGER);
+                CREATE TABLE IF NOT EXISTS scan_revisions(path TEXT PRIMARY KEY,
+                    fingerprint TEXT);
                 CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value INTEGER);
                 INSERT OR IGNORE INTO metadata VALUES('version',0);
             ''')
@@ -102,6 +111,8 @@ class HistoryReader:
                 db.execute('DELETE FROM events')
                 db.execute('DELETE FROM sources')
                 db.execute('DELETE FROM record_proofs')
+                db.execute('DELETE FROM completed_sources')
+                db.execute('DELETE FROM scan_revisions')
                 db.execute("INSERT OR REPLACE INTO metadata VALUES('format',2)")
             if not db.execute("SELECT value FROM metadata WHERE key='proofs'").fetchone():
                 for row in db.execute('SELECT refs FROM events'):
@@ -137,17 +148,53 @@ class HistoryReader:
     def __del__(self):
         self.close()
 
+    def revalidate_device(self, db, path, source, old):
+        # Device numbers can change across mounts. Keep inode and every saved
+        # record proof as guards; validate incrementally rather than trust a remap.
+        info = source.info
+        signature = (source.identity, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        prior, cursor = self.plain_validation.get(path, (None, -1))
+        if prior != signature:
+            cursor = -1
+        if info.st_size < old['offset']:
+            raise ValueError('Source replaced or truncated; history index needs explicit rebuild')
+        rows = db.execute('SELECT offset,length,digest FROM record_proofs WHERE path=? AND offset>? ORDER BY offset LIMIT 4096',
+                          (path, cursor)).fetchall()
+        consumed = 0
+        for proof in rows:
+            if not 0 < proof['length'] <= MAX_LINE:
+                raise ValueError('Invalid indexed record length')
+            source.stream.seek(proof['offset'])
+            raw = source.stream.read(proof['length'])
+            if hashlib.sha256(raw).hexdigest() != proof['digest']:
+                raise ValueError('Indexed source record changed; history index needs explicit rebuild')
+            cursor = proof['offset']
+            consumed += len(raw)
+            if consumed >= WINDOW:
+                break
+        current = os.fstat(source.raw.fileno())
+        if (current.st_size, current.st_mtime_ns, current.st_ctime_ns) != signature[1:]:
+            self.plain_validation[path] = (None, -1)
+            return False
+        self.plain_validation[path] = (signature, cursor)
+        if db.execute('SELECT 1 FROM record_proofs WHERE path=? AND offset>? LIMIT 1', (path, cursor)).fetchone():
+            return False
+        db.execute('UPDATE sources SET identity=? WHERE path=?', (source.identity, path))
+        self.plain_validation.pop(path, None)
+        return True
+
     def ingest(self, db, path, backward=False):
         source = self.open_source(path)
         compressed = source.compressed
         identity, info = source.identity, source.info
+        fingerprint = completion_fingerprint(source.physical, info)
         if compressed:
-            if self.compressed_done.get(path) == identity:
+            if self.compressed_done.get(path) == fingerprint:
                 source.close()
                 return False
             if self.compressed_source:
                 key, existing = self.compressed_source
-                if key == path and existing.identity == identity:
+                if key == path and completion_fingerprint(existing.physical, existing.info) == fingerprint:
                     source.close()
                     source = existing
                 else:
@@ -157,11 +204,21 @@ class HistoryReader:
         with (nullcontext() if compressed else source):
             stream = source.stream
             old = db.execute('SELECT * FROM sources WHERE path=?', (path,)).fetchone()
+            if compressed:
+                revision = db.execute('SELECT fingerprint FROM scan_revisions WHERE path=?', (path,)).fetchone()
+                if not revision or revision['fingerprint'] != fingerprint:
+                    # Partial offsets also belong to one revision. Restart proof
+                    # checking if the source changes again during a rescan.
+                    db.execute('DELETE FROM completed_sources WHERE path=?', (path,))
+                    old = None
             if old and old['identity'] != identity:
                 if compressed or old['identity'].startswith('zstd:'):
                     # Representation changes restart bounded indexing; refs retain
                     # logical paths and uncompressed byte offsets for lazy checks.
                     old = None
+                elif old['identity'].split(':')[-1] == identity.split(':')[-1]:
+                    if not self.revalidate_device(db, path, source, old):
+                        return False
                 else:
                     raise ValueError('Source replaced or truncated; history index needs explicit rebuild')
             if old and not compressed and info.st_size < old['offset']:
@@ -266,8 +323,16 @@ class HistoryReader:
                         old['turn'] if old and backward else turn, (old['skipped'] if old else 0) + skipped,
                         old['dropping'] if old and backward else int(dropping)))
             if compressed:
+                current = os.fstat(source.raw.fileno())
+                if completion_fingerprint(source.physical, current) != fingerprint:
+                    raise ValueError('Compressed source changed during indexing')
+                db.execute('INSERT OR REPLACE INTO scan_revisions VALUES(?,?)', (path, fingerprint))
                 if eof:
-                    self.compressed_done[path] = identity
+                    # Commit EOF with its exact source revision and indexed offset.
+                    # Reopening the UI must not replay gigabytes of unchanged data.
+                    db.execute('INSERT OR REPLACE INTO completed_sources VALUES(?,?,?,?)',
+                               (path, identity, fingerprint, finish))
+                    self.compressed_done[path] = fingerprint
                     self.close()
             if finish != begin:
                 db.execute("UPDATE metadata SET value=value+1 WHERE key='version'")
@@ -325,6 +390,7 @@ class HistoryReader:
                 if not detail:
                     self.close()
                     self.compressed_done.clear()
+                    self.plain_validation.clear()
                 # Python 3.10 lacks sqlite_errorcode; keep its exact FULL message fallback.
                 if (getattr(exc, 'sqlite_errorcode', None) != 13
                         and str(exc) != 'database or disk is full'):
@@ -338,6 +404,7 @@ class HistoryReader:
                 if not detail:
                     self.close()
                     self.compressed_done.clear()
+                    self.plain_validation.clear()
                 raise
 
     def _snapshot(self, before=None, detail=None, anchor=None, capacity_limited=False):
@@ -359,6 +426,17 @@ class HistoryReader:
             warnings = ['Index cache capacity reached. New indexing is paused; close unused viewers to free cache. Source logs are unchanged.'] if capacity_limited else []
             if missing:
                 warnings.append('A registered segment is unavailable')
+            for path, (physical, info) in available.items():
+                fingerprint = completion_fingerprint(physical, info)
+                if not physical.name.endswith('.jsonl.zst') or self.compressed_done.get(path) == fingerprint:
+                    continue
+                saved = db.execute('SELECT c.* FROM completed_sources c JOIN sources s ON c.path=s.path '
+                                   'AND c.identity=s.identity AND c.offset=s.offset WHERE c.path=?', (path,)).fetchone()
+                if saved and saved['fingerprint'] == fingerprint:
+                    # Stat equality is not authorization: recheck exact chat/header.
+                    with self.open_source(path) as source:
+                        if completion_fingerprint(source.physical, source.info) == fingerprint:
+                            self.compressed_done[path] = fingerprint
             changed = False
             # Reserve one of eight chunks for backfill; rotate forward sources fairly.
             position = db.execute("SELECT value FROM metadata WHERE key='source_position'").fetchone()
@@ -370,7 +448,7 @@ class HistoryReader:
             # selecting another compressed segment. Live plain logs stay in rotation.
             compressed = [p for p, (physical, info) in available.items()
                           if physical.name.endswith('.jsonl.zst')
-                          and self.compressed_done.get(p) != source_identity(physical, info)]
+                          and self.compressed_done.get(p) != completion_fingerprint(physical, info)]
             active = self.compressed_source[0] if self.compressed_source else None
             selected = active if active in compressed else next(iter(compressed), None)
             scheduled = [p for p in scheduled if p in available and not available[p][0].name.endswith('.jsonl.zst')]
@@ -396,11 +474,13 @@ class HistoryReader:
                         warnings.append('A registered segment is unavailable')
             indexed = db.execute('SELECT * FROM sources ORDER BY path').fetchall()
             rows_by_path = {row['path']: row for row in indexed}
+            if self.plain_validation:
+                warnings.append('Revalidating saved history after a storage change. Continuous writes may delay recovery; cached summaries are not yet reverified.')
             pending = False
             for path, (physical, info) in available.items():
                 row = rows_by_path.get(path)
                 if physical.name.endswith('.jsonl.zst'):
-                    pending |= self.compressed_done.get(path) != source_identity(physical, info)
+                    pending |= self.compressed_done.get(path) != completion_fingerprint(physical, info)
                 else:
                     pending |= (row is None or row['identity'] != source_identity(physical, info)
                                 or info.st_size > row['offset'] or row['start'] > 0)
