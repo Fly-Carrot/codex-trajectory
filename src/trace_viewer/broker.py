@@ -14,10 +14,15 @@ import secrets
 import signal
 import sqlite3
 import stat
+import sys
 import tempfile
 import threading
 import time
 from urllib.parse import urlsplit, parse_qs
+
+if not __package__:
+    # Isolated direct entry: import only the installed sibling modules.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 try:
     from .server import Handler as BaseHandler, RolloutReader, LoopbackHTTPServer, open_regular_source
@@ -76,7 +81,7 @@ def write_private(path, value):
 
 
 def resolve_session(payload, sessions):
-    if payload.get('hook_event_name') not in ('Stop', 'UserPromptSubmit'):
+    if payload.get('hook_event_name') not in ('Stop', 'UserPromptSubmit', 'SessionStart'):
         raise ValueError('Unsupported hook event')
     thread = str(payload.get('session_id', ''))
     if not THREAD.fullmatch(thread):

@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.3.0 - 2026-10-31
+
+### Registration And Recovery (Preview)
+
+- Add SessionStart registration alongside UserPromptSubmit, with matching link
+  context, bounded transcript-readiness retries and nonblocking null-path handling.
+- Preserve custom hooks on upgrade/uninstall. New SessionStart hooks require
+  native trust review; automatic trust or transcript guessing is never performed.
+
+- Accept app-created independent chats marked `agent_created_thread` for hook
+  registration, history and recovery. Continue rejecting runtime subagent/exec
+  sources, unknown thread kinds and mismatched session identities.
+- Add regression coverage for registration, history, recovery, link context and
+  conflicting subagent or session identity metadata.
+- Add an explicit Reconnect button, bounded automatic retry for transient
+  failures, and optional macOS native recovery for expired links or changed ports.
+  Recovery requires local confirmation and exact registered-chat validation;
+  it does not bypass authentication or automatically open browser tabs.
+- Launch recovery services with isolated Python imports. Preserve unrelated
+  hooks and global rules, and keep native recovery installation opt-in.
+- Persist completed compressed-history scan revisions to avoid replaying
+  unchanged archives after reopening a viewer. Revalidate saved record hashes
+  incrementally when a storage device number changes; reject changed content.
+- Add isolated regression tests for service restart, expired tokens, occupied
+  ports, simultaneous chat recovery and persistent indexing. Existing source
+  logs remain read-only; installations are not restarted by this release.
+- Retry a partially written UTF-8 header without accepting malformed encodings.
+  Check isolated-interpreter decoder availability before installation and document
+  a virtual-environment setup for Python 3.10-3.13; user-only dependencies cannot
+  silently break the background service after upgrade.
+
 ## 0.2.2 - 2026-10-14
 
 ### Compressed And Archived History

@@ -3,17 +3,36 @@ import argparse
 import copy
 from datetime import datetime, timezone
 import fcntl
+import importlib.util
 import json
 import os
 from pathlib import Path
 import shlex
 import stat
+import subprocess
 import sys
 import tempfile
 
 BEGIN = '<!-- CODEX-TRAJECTORY:BEGIN -->'
 END = '<!-- CODEX-TRAJECTORY:END -->'
-FILES = ('events.py', 'server.py', 'sources.py', 'history.py', 'broker.py', 'launcher.py', 'index.html', 'install.py')
+FILES = ('events.py', 'server.py', 'sources.py', 'history.py', 'broker.py', 'launcher.py', 'native.py', 'index.html', 'install.py')
+
+
+def compression_support():
+    module = 'compression.zstd' if sys.version_info >= (3, 14) else 'backports.zstd'
+    probe = subprocess.run([sys.executable, '-I', '-B', '-c', 'import ' + module],
+                           capture_output=True, timeout=10)
+    if probe.returncode == 0:
+        return 'available'
+    try:
+        visible_here = importlib.util.find_spec(module) is not None
+    except ModuleNotFoundError:
+        visible_here = False
+    if visible_here:
+        raise ValueError('Compression decoder is not usable by the isolated service. '
+                         'Use Python 3.14+ or install backports.zstd in a dedicated virtual environment '
+                         'and run the installer with that environment\'s Python (not pip --user).')
+    return 'unavailable; plain JSONL only'
 
 
 def atomic(path, data):
@@ -41,6 +60,7 @@ def strip_rule(text):
 
 
 def configure(home, dry_run=False, uninstall=False):
+    compressed = 'not checked for uninstall' if uninstall else compression_support()
     home = Path(home).expanduser().absolute()
     if home.is_symlink():
         raise ValueError('Refusing symlinked Codex home')
@@ -65,22 +85,23 @@ def configure(home, dry_run=False, uninstall=False):
     previous = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
     owned = {command, previous.get('hook_command', '')}
     updated = copy.deepcopy(hooks)
-    groups = updated.setdefault('hooks', {}).get('UserPromptSubmit', [])
-    if not isinstance(groups, list):
-        raise ValueError('Invalid UserPromptSubmit hooks')
-    retained = []
-    for group in groups:
-        if not isinstance(group, dict) or not isinstance(group.get('hooks'), list):
-            raise ValueError('Invalid hook matcher group')
-        other = [h for h in group['hooks'] if not (isinstance(h, dict) and h.get('command') in owned)]
-        if other == group['hooks']:
-            retained.append(group)
-        elif other:
-            retained.append({**group, 'hooks': other})
-    if not uninstall:
-        retained.append({'hooks': [{'type': 'command', 'command': command, 'timeout': 10,
-                                    'statusMessage': 'codex-trajectory'}]})
-    updated['hooks']['UserPromptSubmit'] = retained
+    for event in ('UserPromptSubmit', 'SessionStart'):
+        groups = updated.setdefault('hooks', {}).get(event, [])
+        if not isinstance(groups, list):
+            raise ValueError('Invalid hook event groups')
+        retained = []
+        for group in groups:
+            if not isinstance(group, dict) or not isinstance(group.get('hooks'), list):
+                raise ValueError('Invalid hook matcher group')
+            other = [h for h in group['hooks'] if not (isinstance(h, dict) and h.get('command') in owned)]
+            if other == group['hooks']:
+                retained.append(group)
+            elif other:
+                retained.append({**group, 'hooks': other})
+        if not uninstall:
+            retained.append({'hooks': [{'type': 'command', 'command': command, 'timeout': 10,
+                                        'statusMessage': 'codex-trajectory'}]})
+        updated['hooks'][event] = retained
     rule = (BEGIN + '\n## codex-trajectory\n\n'
             'At the end of each final reply, append one `[Trajectory](verified URL)` link when the '
             'codex-trajectory hook supplies it for this exact chat. If needed, verify the current link with `'
@@ -107,6 +128,7 @@ def configure(home, dry_run=False, uninstall=False):
     else:
         new_rules = rules + ('\n\n' if rules else '') + rule + '\n'
     result = {'action': 'uninstall' if uninstall else 'install', 'dry_run': dry_run,
+              'compressed_history': compressed,
               'files': [str(p) for p in paths], 'runtime': str(target),
               'hook_trust': 'Review the new hook in Codex /hooks; trust is never changed automatically.'}
     if dry_run:
@@ -152,10 +174,21 @@ def main():
     parser.add_argument('--codex-home', default=os.environ.get('CODEX_HOME', str(Path.home()/'.codex')))
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--uninstall', action='store_true')
+    parser.add_argument('--recovery-only', action='store_true', help='Install the optional macOS recovery app; do not change hooks or rules')
     args = parser.parse_args()
     try:
-        print(json.dumps(configure(args.codex_home, args.dry_run, args.uninstall), indent=2))
-    except (ValueError, OSError, UnicodeError) as exc:
+        if args.recovery_only:
+            if args.uninstall:
+                raise ValueError('Do not combine --recovery-only and --uninstall')
+            try:
+                from .native import install_app
+            except ImportError:
+                from native import install_app
+            result = install_app(Path(args.codex_home).expanduser()/'codex-trajectory', args.dry_run)
+        else:
+            result = configure(args.codex_home, args.dry_run, args.uninstall)
+        print(json.dumps(result, indent=2))
+    except (ValueError, OSError, UnicodeError, subprocess.SubprocessError) as exc:
         parser.exit(1, 'Installation stopped: '+str(exc)+'\n')
 
 

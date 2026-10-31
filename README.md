@@ -38,8 +38,21 @@ supported rollout logs. Windows is not supported (POSIX file locking).
 Node is only used by JavaScript regression tests, not by the viewer.
 
 For compressed Codex history (`.jsonl.zst`), use **Python 3.14+** (built-in
-decoder). On Python 3.10-3.13, install `backports.zstd` in the same environment
-used to run the installer: `python3 -m pip install backports.zstd`.
+decoder). On Python 3.10-3.13, use a dedicated virtual environment:
+
+```sh
+python3 -m venv ~/.local/share/codex-trajectory-venv
+~/.local/share/codex-trajectory-venv/bin/python -m pip install backports.zstd
+# After cloning, run install.py with this same environment's Python.
+~/.local/share/codex-trajectory-venv/bin/python install.py --dry-run
+~/.local/share/codex-trajectory-venv/bin/python install.py
+```
+
+Keep that environment after installation. The service uses isolated Python
+(`-I`), so `pip --user` and `PYTHONPATH` dependencies are not available to it.
+Installation checks decoder visibility before changing files and reports whether
+compressed history is available. Do not switch interpreters between dry-run and
+installation. The generic commands below assume your chosen `python3` is suitable.
 Plain JSONL viewing does not require this optional package.
 See [segment recovery and limits](docs/segment-recovery.md) for archive handling,
 resource bounds, and the upstream projects informing the fix.
@@ -52,7 +65,7 @@ python3 install.py
 ```
 
 The installer copies the small runtime to `$CODEX_HOME/codex-trajectory` (default
-`~/.codex/codex-trajectory`), appends one owned `UserPromptSubmit` hook to
+`~/.codex/codex-trajectory`), appends owned `SessionStart` and `UserPromptSubmit` hooks to
 `hooks.json`, and adds a delimited English block to `AGENTS.md`. Existing hooks,
 custom instructions, `config.toml`, notify handlers and the app bundle are left
 alone. Original hook/rule files are backed up privately before modification.
@@ -77,6 +90,20 @@ After a new message, the hook registers the exact chat and supplies a link:
 ```text
 [Trajectory](http://127.0.0.1:PORT/t/THREAD_ID#PRIVATE_TOKEN)
 ```
+
+SessionStart also registers independent chats at startup/resume/fork (including
+agent-created worktree chats), provided the host invokes the trusted hook and
+supplies a readable transcript. UserPromptSubmit remains the fallback. Both use
+the same handler and reuse the chat connection; runtime subagents are not
+registered as independent panels. Review the **new SessionStart entry** in
+`/hooks` after upgrading; existing UserPromptSubmit trust does not imply trust
+for the new entry. The installer never changes trust records.
+
+Missing or partially written exact transcript files are retried three times,
+with 450 ms total delay. A null transcript path defers immediately without
+scanning for another chat or blocking work. A later supported hook can retry.
+If the host fires neither event, automatic registration is not guaranteed;
+manual registration still works. See [startup Spec](docs/session-registration-spec.md).
 
 The rule asks the agent to include it at the end of the final reply. This is
 **model-followed guidance, not a guaranteed UI injection**. The tool does not edit
@@ -104,6 +131,36 @@ The listener prefers its saved port. If another program occupies it, a free port
 is selected and connection records are refreshed. Open the newly returned link:
 an old address cannot redirect itself from another program. A real listener
 restart also rotates chat credentials, even when the port is unchanged.
+
+### Reconnect without an agent
+
+Each panel has a **Reconnect** button. Temporary failures retry with backoff up
+to 30 seconds without clearing history or changing Follow. Hidden and paused
+panels do not fetch logs. Expired access stops requests instead of relaxing
+authentication.
+
+For offline services, expired links or changed ports, macOS users can install
+the optional native recovery app after installing the current runtime:
+
+```sh
+python3 install.py --recovery-only --dry-run
+python3 install.py --recovery-only
+```
+
+This does not change hooks or global rules. **Open local recovery** (or Reconnect
+after an authentication failure) asks for native confirmation, validates the
+registered chat and listener, then opens a fresh private link in your default
+browser. The URL handler receives only a chat ID, not a credential or arbitrary
+endpoint. It may open a new browser tab, not replace the Codex panel.
+
+If the old HTTP page cannot load at all, open
+`~/.codex/codex-trajectory/Trajectory Recovery.app` in Finder and choose the chat,
+or use `--resume` above. A stopped server cannot serve its own recovery button.
+There is no additional always-on service and no port scanning. Keep access links
+private. See [the recovery Spec](docs/reconnect-spec.md).
+If an embedded browser blocks custom protocols, launch the recovery app from
+Finder instead. Browser automation is not proof that this native handoff works;
+verify it once with a manual click in your actual host.
 
 To use a non-default Codex home: `python3 install.py --codex-home /your/codex-home`.
 The installer never enables feature flags, bypasses hook trust, or changes sandbox

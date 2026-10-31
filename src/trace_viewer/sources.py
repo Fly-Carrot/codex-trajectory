@@ -37,6 +37,10 @@ class SourcePending(Exception):
     """A bounded forward scan will continue at the next refresh."""
 
 
+class TranscriptNotReady(ValueError):
+    """The first transcript record has not finished being written."""
+
+
 def logical_path(path, sessions):
     path, sessions = Path(path), Path(sessions)
     if str(path).endswith('.jsonl.zst'):
@@ -141,12 +145,27 @@ class Source:
         self.identity = identity(self.physical, self.info)
         try:
             self.stream = decoder(self.raw) if self.compressed else self.raw
-            header = json.loads(self.stream.readline(HEADER_LIMIT + 1))
+            raw_header = self.stream.readline(HEADER_LIMIT + 1)
+            if len(raw_header) > HEADER_LIMIT:
+                raise ValueError('Source header exceeds limit')
+            try:
+                header = json.loads(raw_header)
+            except UnicodeDecodeError as exc:
+                if (not self.compressed and not raw_header.endswith(b'\n')
+                        and exc.encoding == 'utf-8' and exc.reason == 'unexpected end of data'
+                        and exc.end == len(raw_header)):
+                    raise TranscriptNotReady('Source header pending') from None
+                raise
+            except json.JSONDecodeError:
+                if not self.compressed and not raw_header.endswith(b'\n'):
+                    raise TranscriptNotReady('Source header pending') from None
+                raise
             meta = header.get('payload') if isinstance(header, dict) else None
             if (not isinstance(meta, dict) or header.get('type') != 'session_meta'
                     or meta.get('id') != thread):
                 raise ValueError('Wrong source thread or invalid source header')
-            if (meta.get('thread_source') not in (None, 'user') or isinstance(meta.get('source'), dict)
+            # App-created peer chats are not runtime subagents; source guards still apply.
+            if (meta.get('thread_source') not in (None, 'user', 'agent_created_thread') or isinstance(meta.get('source'), dict)
                     or meta.get('source') in ('exec', 'subagent')):
                 raise ValueError('Not a main chat')
             self.meta = meta

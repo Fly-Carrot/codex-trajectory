@@ -16,9 +16,9 @@
 </head>
 <body>
 <header><span class="brand">codex-trajectory</span><span class="tab">Trajectory</span><span class="thread" id="thread"></span><span class="status" id="status">Connecting</span></header>
-<div class="toolbar"><select id="scale" aria-label="Timeline scale"><option value="events">Event order</option><option value="time">Clock time</option></select><button id="zoom-out" aria-label="Zoom out">−</button><button id="zoom-in" aria-label="Zoom in">+</button><button id="earlier" hidden>Load earlier</button><button id="latest">Latest</button><span id="history-note" class="history-note" role="status"></span><span class="spacer"></span><input class="search" id="search" placeholder="Search" aria-label="Search events"><button id="follow" aria-pressed="true">Follow</button><button id="pause" aria-pressed="false">Pause</button></div>
+<div class="toolbar"><select id="scale" aria-label="Timeline scale"><option value="events">Event order</option><option value="time">Clock time</option></select><button id="zoom-out" aria-label="Zoom out">−</button><button id="zoom-in" aria-label="Zoom in">+</button><button id="earlier" hidden>Load earlier</button><button id="latest">Latest</button><span id="history-note" class="history-note" role="status"></span><span class="spacer"></span><input class="search" id="search" placeholder="Search" aria-label="Search events"><button id="follow" aria-pressed="true">Follow</button><button id="reconnect">Reconnect</button><button id="pause" aria-pressed="false">Pause</button></div>
 <div id="warnings" role="status" hidden style="flex:none;padding:6px 12px;color:#dfb476;background:#392f21;max-height:80px;overflow:auto;white-space:pre-wrap"></div>
-<div id="recovery" role="status" hidden style="flex:none;padding:8px 12px;color:#dfb476;background:#392f21">Open the latest Trajectory link in this chat. If the service restarted, send a message in this chat to refresh the link. Your saved logs have not been deleted. Keep access links private.</div>
+<div id="recovery" role="status" hidden style="flex:none;padding:8px 12px;color:#dfb476;background:#392f21"><span id="recovery-message"></span> <a id="local-recovery" hidden style="color:#8fb9fa">Open local recovery</a><span id="recovery-help"> · Requires Trajectory Recovery on macOS. If this page cannot open at all, launch that app directly. Logs are unchanged.</span></div>
 <div class="timeline"><div class="labels" id="lane-labels" aria-label="Event categories"></div><div class="viewport" id="timeline-scroll" tabindex="0" aria-label="Timeline. Drag or scroll to pan; Control plus wheel to zoom."><div id="track"></div></div></div>
 <div class="content"><main class="ledger" id="events" aria-label="Event ledger"><div class="empty">Connecting to this conversation…</div></main><aside id="inspector" hidden aria-label="Selected event"><div class="inspect-head"><strong id="inspect-title"></strong><button id="close" aria-label="Close details">×</button></div><div class="inspect-meta" id="inspect-meta"></div><pre id="inspect-body"></pre></aside></div>
 <footer><span id="count">0</span><span>records</span><span id="calls">0</span><span>operations</span><span id="returns">0</span><span>closed</span><span class="spacer"></span><span id="updated"></span><button id="wrappers" aria-pressed="false" title="Show folded wrapper result rows">Wrapper results</button><button id="about">Info</button></footer>
@@ -34,6 +34,9 @@ try{token=token||sessionStorage.getItem(tokenKey)||'';if(token)sessionStorage.se
 if(token&&!location.hash)history.replaceState(null,'',location.pathname+'#'+token);
 window.addEventListener('hashchange',()=>{if(location.hash&&location.hash.slice(1)!==token)location.reload()});
 const endpoint=threadPath?'/api/threads/'+threadPath[1]:'/api';
+const recoveryURL=threadPath?'codex-trajectory://reconnect/'+threadPath[1]:null;
+const reconnectButton=$('reconnect');
+if(recoveryURL){$('local-recovery').href=recoveryURL;$('local-recovery').hidden=false}
 let canonicalEvents=[],showWrappers=false;
 let events=[],version=-1,selected=null,follow=true,ledgerFollow=true,paused=false,zoom=1,drag=null,moved=false;
 const track=$('track'),viewport=$('timeline-scroll'),ledger=$('events');
@@ -73,15 +76,15 @@ function historyControls(){
 }
 function reportError(error){
  $('status').textContent=reconnect?'Reconnect required':error.message;$('status').classList.add('error');
- const help=$('recovery');if(help){help.hidden=false;help.textContent=reconnect?
+ const help=$('recovery');if(help){help.hidden=false;$('recovery-message').textContent=reconnect?
   (token?'This access link has expired. ':'This tab is missing its access link. ')+
-  'Open the latest Trajectory link in this chat. If the service restarted, send a message in this chat to refresh the link. Keep access links private.':
-  'Could not load the local viewer. Retrying automatically. If it stays unavailable, send a message in this chat to restart the viewer. Saved logs are not deleted by a connection failure.'}
+  'Click Reconnect and confirm local recovery for this chat.':
+  'Connection interrupted. Retrying with backoff; use local recovery if the service stopped or moved.'}
  historyControls();
 }
 async function requestEvents(query=''){
  if(!token){reconnect=true;throw Error('Access link required')}
- const r=await fetch(endpoint+'/events'+query,{headers:{Authorization:'Bearer '+token},cache:'no-store',signal:AbortSignal.timeout(7000)});
+ const r=await fetch(endpoint+'/events'+query,{headers:{Authorization:'Bearer '+token},cache:'no-store',redirect:'error',signal:AbortSignal.timeout(7000)});
  if(!r.ok){if(r.status===401){reconnect=true;throw Error('Reconnect required')}throw Error('Log unavailable ('+r.status+')')}
  return r.json();
 }
@@ -285,7 +288,7 @@ viewport.addEventListener('keydown',e=>{if(e.key==='ArrowLeft'||e.key==='ArrowRi
 ledger.addEventListener('wheel',e=>{if(e.deltaY<0)ledgerFollow=false},{passive:true});ledger.addEventListener('touchstart',()=>{ledgerFollow=false},{passive:true});ledger.addEventListener('keydown',e=>{if(['ArrowUp','PageUp','Home'].includes(e.key))ledgerFollow=false});
 ledger.addEventListener('scroll',()=>{ledgerFollow=ledger.scrollHeight-ledger.scrollTop-ledger.clientHeight<=50;renderLedger();saveView()});
 viewport.addEventListener('scroll',saveView);
-$('follow').onclick=()=>{setFollow(true);$('search').value='';draw()};$('pause').onclick=()=>{paused=!paused;$('pause').textContent=paused?'Resume':'Pause';$('pause').setAttribute('aria-pressed',String(paused));$('status').textContent=reconnect?'Reconnect required':paused?'Paused':liveStatus()};
+$('follow').onclick=()=>{setFollow(true);$('search').value='';draw()};$('pause').onclick=()=>{paused=!paused;$('pause').textContent=paused?'Resume':'Pause';$('pause').setAttribute('aria-pressed',String(paused));$('status').textContent=reconnect?'Reconnect required':paused?'Paused':liveStatus();if(!paused){clearTimeout(timer);poll()}};
 $('zoom-in').onclick=()=>doZoom(1.3);$('zoom-out').onclick=()=>doZoom(1/1.3);$('scale').onchange=draw;$('search').oninput=()=>{setFollow(false);draw()};$('close').onclick=()=>{pendingDetails=false;detailRequest++;$('inspector').hidden=true;saveView()};$('about').onclick=()=>{$('info').hidden=!$('info').hidden};window.addEventListener('resize',draw);
 $('wrappers').onclick=()=>{showWrappers=!showWrappers;$('wrappers').setAttribute('aria-pressed',String(showWrappers));events=timelineItems(canonicalEvents,showWrappers);$('count').textContent=events.length;draw()};
 $('earlier').onclick=loadEarlier;$('latest').onclick=latest;
@@ -301,7 +304,19 @@ function restoreView(){
  document.querySelectorAll('[data-event]').forEach(n=>n.classList.toggle('selected',n.dataset.event===selected));
  renderLedger();restoring=false;saveView();
 }
-let timer=null,inflight=false;
+let timer=null,inflight=false,failures=0;
+function retryDelay(){return document.hidden||paused?30000:Math.min(30000,1500*2**Math.min(failures,5))}
+function reconnectPanel(){
+ if(reconnect&&recoveryURL){
+  $('recovery-message').textContent='Confirm local recovery. If your browser blocks it, open Trajectory Recovery.app in Finder; your logs are unchanged.';
+  location.href=recoveryURL;return;
+ }
+ failures=0;clearTimeout(timer);
+ // Do not reset history, Follow, selection or the user's Pause setting.
+ if(paused){$('recovery').hidden=false;$('recovery-message').textContent='Paused. Resume to retry, or use local recovery.';return}
+ poll();
+}
+reconnectButton.onclick=reconnectPanel;
 async function poll(){
  if(inflight)return;inflight=true;const epoch=generation;
  try{
@@ -310,6 +325,7 @@ async function poll(){
   const cursor=restoring&&!anchor&&typeof savedView.cursor==='string'?savedView.cursor:null;
   let data=await requestEvents(anchor?'?anchor='+encodeURIComponent(anchor):cursor?'?before='+encodeURIComponent(cursor):'');
   if(epoch!==generation||reconnect)return;
+  failures=0;
   acceptWarnings(data);
   // An incomplete backfill cannot restore history yet. Keep the saved target
   // while displaying temporary live summaries; replace those when it is ready.
@@ -331,7 +347,7 @@ async function poll(){
    refreshEvents();if(restoring)restoreView();
   }
   historyControls();
- }catch(error){reportError(error)}finally{inflight=false;clearTimeout(timer);timer=setTimeout(poll,document.hidden?30000:1500)}
+ }catch(error){failures++;reportError(error)}finally{inflight=false;clearTimeout(timer);if(!reconnect)timer=setTimeout(poll,retryDelay())}
 }
 window.addEventListener('pagehide',saveView);
 document.addEventListener('visibilitychange',()=>{clearTimeout(timer);poll()});poll();

@@ -11,6 +11,61 @@ HTML = Path(__file__).resolve().parents[1] / 'src/trace_viewer/index.html'
 
 @unittest.skipUnless(shutil.which('node'), 'Node is needed to execute browser layout logic')
 class TimelineLayoutTests(unittest.TestCase):
+    def recovery_logic(self, body):
+        source = HTML.read_text()
+        helper = source[source.index('function retryDelay()'):source.index('reconnectButton.onclick=')]
+        setup = """
+let failures=0,reconnect=false,paused=false,timer=null,calls=0;
+let selected='old-event',follow=false,events=[{id:'old-event'}];
+const recoveryURL='codex-trajectory://reconnect/chat-a';
+const location={href:'http://127.0.0.1:1234/t/chat-a#expired'};
+const document={hidden:false};
+const nodes={recovery:{hidden:true},'recovery-message':{textContent:''}};
+const $=id=>nodes[id];
+function poll(){calls++}
+"""
+        result = subprocess.run(['node','-e',setup+helper+body],
+                                check=True,capture_output=True,text=True)
+        return json.loads(result.stdout)
+
+    def test_reconnect_preserves_reading_state(self):
+        result = self.recovery_logic("reconnectPanel();console.log(JSON.stringify({calls,selected,follow,events}));")
+        self.assertEqual(result, dict(calls=1,selected='old-event',follow=False,events=[{'id':'old-event'}]))
+
+    def test_expired_link_native_recovery_requires_button(self):
+        result = self.recovery_logic("reconnect=true;const before=location.href;reconnectPanel();console.log(JSON.stringify({before,after:location.href,calls}));")
+        self.assertEqual(result['before'], 'http://127.0.0.1:1234/t/chat-a#expired')
+        self.assertEqual(result['after'], 'codex-trajectory://reconnect/chat-a')
+        self.assertEqual(result['calls'], 0)
+        source = HTML.read_text()
+        self.assertEqual(source.count('location.href=recoveryURL'), 1)
+        self.assertIn("redirect:'error'", source)
+
+    def test_retry_backoff_is_bounded_and_pause_is_preserved(self):
+        result = self.recovery_logic("""
+const delays=[0,1,2,3,20].map(n=>{failures=n;return retryDelay()});
+paused=true;reconnectPanel();
+console.log(JSON.stringify({delays,paused,calls,selected,follow,delay:retryDelay()}));
+""")
+        self.assertEqual(result['delays'], [1500,3000,6000,12000,30000])
+        self.assertEqual(result['delay'], 30000)
+        self.assertTrue(result['paused'])
+        self.assertEqual(result['calls'], 0)
+        self.assertEqual(result['selected'], 'old-event')
+        self.assertFalse(result['follow'])
+
+    def test_pause_reconnect_resume_restarts_polling(self):
+        source = HTML.read_text()
+        handler = source[source.index("$('pause').onclick="):source.index("$('zoom-in').onclick")]
+        result = self.recovery_logic("""
+nodes.pause={setAttribute(){}};nodes.status={textContent:''};
+function liveStatus(){return 'Live'}
+"""+handler+"""
+nodes.pause.onclick();reconnectPanel();nodes.pause.onclick();
+console.log(JSON.stringify({paused,calls}));
+""")
+        self.assertEqual(result, dict(paused=False,calls=1))
+
     def auth_bootstrap(self, body):
         source = HTML.read_text()
         script = source[source.index('const threadPath='):source.index('const endpoint=')]
@@ -209,14 +264,14 @@ class HistoryFrontendTests(unittest.TestCase):
         self.run_frontend('''
 token='';await poll();
 assert.equal(requests.length,0);assert.equal(reconnect,true);
-assert.match($('recovery').textContent,/missing its access link/);
+assert.match($('recovery-message').textContent,/missing its access link/);
 await poll();assert.equal(requests.length,0);
 ''')
 
     def test_expired_token_keeps_authentication_and_explains_recovery(self):
         self.run_frontend('''
 responses.push({status:401});await poll();
-assert.equal(reconnect,true);assert.match($('recovery').textContent,/expired/);
+assert.equal(reconnect,true);assert.match($('recovery-message').textContent,/expired/);
 assert.equal(requests[0].options.headers.Authorization,'Bearer auth-secret');
 await poll();assert.equal(requests.length,1);
 ''')
@@ -225,7 +280,7 @@ await poll();assert.equal(requests.length,1);
         self.run_frontend('''
 responses.push(()=>{throw Error('offline')});await poll();
 assert.equal(reconnect,false);assert.equal($('recovery').hidden,false);
-assert.match($('recovery').textContent,/Retrying automatically/);
+assert.match($('recovery-message').textContent,/Retrying with backoff/);
 responses.push(page([event(1)]));await poll();
 assert.equal($('recovery').hidden,true);assert.equal($('status').textContent,'Live');
 ''')
