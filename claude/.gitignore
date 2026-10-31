@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+.DS_Store
+.claude-trajectory-local/
+*.jsonl
+*.ndjson
+connection.json
+service.json
+registry.json
+installation.json
+backups/
+runtime/
+*.sqlite3
+*.sqlite3-*
+.env*
