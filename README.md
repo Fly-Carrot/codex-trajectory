@@ -1,321 +1,34 @@
-# codex-trajectory
+# trajectory
 
-**A quiet, live timeline for your Codex chats.**
+**Quiet, live, read-only timelines for local coding-agent sessions.**
 
 [![Tests](https://github.com/Fly-Carrot/codex-trajectory/actions/workflows/tests.yml/badge.svg)](https://github.com/Fly-Carrot/codex-trajectory/actions/workflows/tests.yml)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-7cafd0)
 ![Local only](https://img.shields.io/badge/runtime-local%20only-7faf91)
 [![MIT](https://img.shields.io/badge/license-MIT-a182bd)](LICENSE)
 
-See public messages, commands, file changes, MCP calls, agent operations and tool
-outputs as they arrive. One shared local process. No additional model calls.
-No API key. No KnowledgeOS dependency.
+Each observer reads the transcripts its agent already writes and shows public messages,
+commands, file operations, MCP calls, subagents and tool results on the same
+twelve-row timeline. One shared local process per agent. No additional model calls.
+No API key.
 
-![Timeline with separate category rows and linked outputs. Fictional demonstration data.](docs/preview.jpg)
+| Folder | For | Installs as | Status |
+| --- | --- | --- | --- |
+| [`codex/`](codex/README.md) | Codex desktop and CLI | `codex-trajectory` | v0.3.0 preview |
+| [`claude/`](claude/README.md) | Claude Code (desktop and CLI) | `claude-trajectory` | 0.1.x preview |
 
-*Screenshot uses entirely fictional demonstration data, not a real conversation.*
+The two implementations are independent: separate installers, hooks, runtime
+directories, URL schemes and recovery apps. Installing one never changes the other.
+Run each folder's commands from inside that folder, for example:
 
-## What you get
-
-- Twelve compact category rows in a fixed order, including empty rows. No activity hints.
-- Shared horizontal scrolling, event-order / clock-time views, zoom and live follow.
-- A chronological ledger with searchable previews and click-to-inspect details.
-- **Tool Results** appears below Other Tools at the recorded return time. It is a linked
-  view of a result, not a second tool call or proof that a side effect succeeded.
-- **Artifacts** shows existing workspace report files explicitly linked in final
-  replies, above **Agent**. This verifies existence, not who created the file.
-- **Agent** distinguishes Progress / Final messages; **Subagents** is separate.
-- Tool badges show Skill (loaded) or Plugin only when supported by source evidence.
-- One private URL per chat; exact transcript binding, never "the latest log".
-- Optional global hook registers chats and supplies their link to Codex. A small
-  English instruction asks Codex to append that link to its final reply.
-- No automatic browser popups. No per-tool logging ritual or new task gate.
-
-## Quick start
-
-Requires **Python 3.10+**, macOS or Linux, and a local Codex client that writes
-supported rollout logs. Windows is not supported (POSIX file locking).
-Node is only used by JavaScript regression tests, not by the viewer.
-
-For compressed Codex history (`.jsonl.zst`), use **Python 3.14+** (built-in
-decoder). On Python 3.10-3.13, use a dedicated virtual environment:
-
-```sh
-python3 -m venv ~/.local/share/codex-trajectory-venv
-~/.local/share/codex-trajectory-venv/bin/python -m pip install backports.zstd
-# After cloning, run install.py with this same environment's Python.
-~/.local/share/codex-trajectory-venv/bin/python install.py --dry-run
-~/.local/share/codex-trajectory-venv/bin/python install.py
-```
-
-Keep that environment after installation. The service uses isolated Python
-(`-I`), so `pip --user` and `PYTHONPATH` dependencies are not available to it.
-Installation checks decoder visibility before changing files and reports whether
-compressed history is available. Do not switch interpreters between dry-run and
-installation. The generic commands below assume your chosen `python3` is suitable.
-Plain JSONL viewing does not require this optional package.
-See [segment recovery and limits](docs/segment-recovery.md) for archive handling,
-resource bounds, and the upstream projects informing the fix.
-
-```sh
-git clone https://github.com/Fly-Carrot/codex-trajectory.git
-cd codex-trajectory
+```bash
+git clone https://github.com/Fly-Carrot/codex-trajectory.git trajectory
+cd trajectory/claude
 python3 install.py --dry-run
-python3 install.py
 ```
 
-The installer copies the small runtime to `$CODEX_HOME/codex-trajectory` (default
-`~/.codex/codex-trajectory`), appends owned `SessionStart` and `UserPromptSubmit` hooks to
-`hooks.json`, and adds a delimited English block to `AGENTS.md`. Existing hooks,
-custom instructions, `config.toml`, notify handlers and the app bundle are left
-alone. Original hook/rule files are backed up privately before modification.
-Re-running installation is idempotent.
+Shared fixes are applied to each folder separately and tested with that folder's own
+suite. Tags are prefixed by component (`codex-v…`, `claude-v…`); earlier `v0.x` tags
+belong to the Codex observer.
 
-Installation does not terminate an already-running observer. Updated runtime
-files take effect on its next start; retrieve a fresh verified link then.
-
-To update an existing checkout, run `git pull --ff-only` followed by
-`python3 install.py --dry-run` and `python3 install.py`. This preserves private
-history indexes and unrelated hooks/rules. A computer restart also stops the old
-listener; the next trusted hook invocation or `--resume` starts the updated copy.
-
-**Review and trust the new hook in Codex `/hooks`.** Installation does not trust
-it for you. Resume/start a conversation after reviewing it if the current client
-has not reloaded hooks. Some clients expose hook review differently; see the
-[official hooks documentation](https://developers.openai.com/codex/hooks).
-Hosts without `UserPromptSubmit` support can use manual registration below.
-
-After a new message, the hook registers the exact chat and supplies a link:
-
-```text
-[Trajectory](http://127.0.0.1:PORT/t/THREAD_ID#PRIVATE_TOKEN)
-```
-
-SessionStart also registers independent chats at startup/resume/fork (including
-agent-created worktree chats), provided the host invokes the trusted hook and
-supplies a readable transcript. UserPromptSubmit remains the fallback. Both use
-the same handler and reuse the chat connection; runtime subagents are not
-registered as independent panels. Review the **new SessionStart entry** in
-`/hooks` after upgrading; existing UserPromptSubmit trust does not imply trust
-for the new entry. The installer never changes trust records.
-
-Missing or partially written exact transcript files are retried three times,
-with 450 ms total delay. A null transcript path defers immediately without
-scanning for another chat or blocking work. A later supported hook can retry.
-If the host fires neither event, automatic registration is not guaranteed;
-manual registration still works. See [startup Spec](docs/session-registration-spec.md).
-
-The rule asks the agent to include it at the end of the final reply. This is
-**model-followed guidance, not a guaranteed UI injection**. The tool does not edit
-old messages. Observer failures never block a task. If no link appears, inspect
-hook trust and use the verified-link command below; do not guess a URL.
-
-```sh
-python3 ~/.codex/codex-trajectory/codex-trajectory --url --thread-id THREAD_ID
-```
-
-If the service stopped, recover an already registered chat with:
-
-```sh
-python3 ~/.codex/codex-trajectory/codex-trajectory --resume --thread-id THREAD_ID
-```
-
-`--url` only checks an existing connection; `--resume` can start the listener and
-returns a verified private link. Neither command opens a tab automatically.
-Closing/reopening the client keeps the independent listener and disk index.
-After an OS reboot or a service restart, send a message to trigger the trusted
-hook, or run `--resume`. Keep the full private link, including its `#` fragment;
-it allows page restoration without depending on temporary browser storage.
-
-The listener prefers its saved port. If another program occupies it, a free port
-is selected and connection records are refreshed. Open the newly returned link:
-an old address cannot redirect itself from another program. A real listener
-restart also rotates chat credentials, even when the port is unchanged.
-
-### Reconnect without an agent
-
-Each panel has a **Reconnect** button. Temporary failures retry with backoff up
-to 30 seconds without clearing history or changing Follow. Hidden and paused
-panels do not fetch logs. Expired access stops requests instead of relaxing
-authentication.
-
-For offline services, expired links or changed ports, macOS users can install
-the optional native recovery app after installing the current runtime:
-
-```sh
-python3 install.py --recovery-only --dry-run
-python3 install.py --recovery-only
-```
-
-This does not change hooks or global rules. **Open local recovery** (or Reconnect
-after an authentication failure) asks for native confirmation, validates the
-registered chat and listener, then opens a fresh private link in your default
-browser. The URL handler receives only a chat ID, not a credential or arbitrary
-endpoint. It may open a new browser tab, not replace the Codex panel.
-
-If the old HTTP page cannot load at all, open
-`~/.codex/codex-trajectory/Trajectory Recovery.app` in Finder and choose the chat,
-or use `--resume` above. A stopped server cannot serve its own recovery button.
-There is no additional always-on service and no port scanning. Keep access links
-private. See [the recovery Spec](docs/reconnect-spec.md).
-If an embedded browser blocks custom protocols, launch the recovery app from
-Finder instead. Browser automation is not proof that this native handoff works;
-verify it once with a manual click in your actual host.
-
-To use a non-default Codex home: `python3 install.py --codex-home /your/codex-home`.
-The installer never enables feature flags, bypasses hook trust, or changes sandbox
-permissions. Honor your host's own approval policy.
-
-### Uninstall
-
-```sh
-python3 install.py --uninstall
-```
-
-This removes only the owned hook and rule block, preserving unrelated edits.
-Runtime, private backups and state are retained for recovery. Closing the page
-stops active log polling. The shared listener remains running until explicitly
-stopped or the computer shuts down; uninstalling the hook does not terminate it.
-The installed copy can also uninstall itself:
-`python3 ~/.codex/codex-trajectory/app/install.py --uninstall`.
-
-### Manual mode: no global edits
-
-```sh
-python3 trajectory.py --thread-id THREAD_ID --log /absolute/path/to/exact-rollout.jsonl
-```
-
-Open the returned private URL when needed. `--auto-open` is an explicit macOS
-convenience, never the default. A resumed chat with a new physical log must be
-registered again with that exact path. The shared viewer retains previously
-registered segments and discovers matching filenames on first registration,
-validating each file's thread identity before including it. It cannot recover
-source logs that Codex or the user has already removed.
-
-## Event semantics
-
-| Track | Meaning |
-| --- | --- |
-| User | Recorded user message |
-| Command | Structured shell command and recorded execution status |
-| File | Recorded file-change operation, not independent artifact verification |
-| MCP | MCP server/tool, arguments, text result and recorded status |
-| Subagents | Dispatch/wait/collaboration operation, not a count of successful agents |
-| Context | A compaction event; internal context is not shown |
-| Plan | Structured Plan-mode proposals; plain prose and turn/plan/updated notifications are not inferred |
-| Search | Native WebSearch/webSearch or Extension/web.search items; browser MCP and shell browsing keep their original categories |
-| Other Tools | Other recorded function/custom-tool operations |
-| Tool Results | Linked result preview at a known return/completion timestamp |
-| Artifacts | Final-reply references to existing regular report files inside the session workspace |
-| Agent | Public Progress / Final messages, not hidden reasoning; always the last present track |
-
-Turn boundaries span tracks. Failures are red in their original track. Same-ID
-starts/results/completions merge; distinct wrapper and nested calls stay distinct.
-Tool Results adds a visible marker/ledger row without inflating operation counts.
-Known successful exec wrapper result projections are folded by default; the
-Wrapper results toggle restores them. Errors and unknown results remain visible.
-Original events and their redacted, bounded previews remain in the inspector.
-Artifacts use the final-reference timestamp, not an inferred creation time. At
-most 32 references are checked per history page, prioritizing recent final replies;
-opening a message checks up to 16 references. Code blocks, external URLs, source-code
-files, symlinks and paths outside the recorded workspace are excluded. Files are
-not downloaded or served. This is a bounded reference view, not a complete file inventory.
-Skill badges require a successful single-file skill read and mean loaded, not
-executed. Plugin badges require explicit structured provenance; names in tool
-arguments or results do not count. Logs without provenance have no such badge.
-Timeline mark widths do not imply duration. Only recorded operation duration is
-shown in details; no internal model latency is inferred. Reading a skill file
-does not prove that the skill was executed. Unsupported schemas are omitted.
-
-## How it works
-
-```text
-Codex UserPromptSubmit hook
-  -> exact thread ID + transcript path
-  -> one shared loopback broker
-  -> private per-chat URL supplied to the agent
-  -> private, rebuildable per-chat SQLite index
-  -> browser requests bounded history pages only while visible
-```
-
-The observer reads local JSONL transcripts, not an App Server writer connection.
-It polls at 1.5 seconds while visible. Hidden tabs use a lightweight 30-second
-status check without reading logs. At most eight readers are cached; idle caches
-expire after two minutes. The lightweight listener stays available when idle. The embedded
-SQLite index uses Python's standard library, not another database service.
-Each source starts near its last 2 MiB; older ranges are indexed incrementally.
-At most eight source chunks are processed per request. Chat readers use separate
-locks, so one chat's parsing does not hold the shared registry lock.
-
-Pages contain the latest 20 recorded turns, capped at 300 canonical events.
-**Load earlier** becomes available after initial indexing; **Latest** returns to
-the live tail. A long first-time history may take several minutes to index.
-The browser retains at most 1,200 canonical events and virtualizes ledger rows.
-Continuing backward slides this window rather than refusing older history.
-Details load on click. View position is saved separately for each chat; transcript
-content and private URLs are not stored in that view-position record.
-
-Only bounded public summaries and source offsets/hashes are indexed. Original
-Codex logs remain read-only and are never automatically deleted. The disk index
-persists across service restarts. Main SQLite indexes share a **512 MiB budget**;
-least-recently-used inactive indexes are removed automatically and can be rebuilt.
-If active readers occupy the budget, new indexing pauses with a visible warning
-while the last safe index remains readable. Close unused viewers to release their
-readers after the idle interval. This is not a total-folder cap: original logs,
-temporary SQLite journals, installation backups and memory are outside it.
-It is a cache, not an independent archive: full
-details still need the source log. Unsupported or oversized source records may be
-omitted and are reported in coverage statistics.
-
-Missing segments produce a visible incomplete-history warning while surviving
-segments remain readable. If all sources are unavailable, the viewer reports an
-error instead of substituting another chat. Index formats from earlier local
-pre-release builds are rebuilt once without changing source logs.
-
-## Privacy and security
-
-- Loopback only; per-chat random bearer tokens, private state permissions.
-- Strict Host/Origin checks, no CORS, no-store responses and restrictive CSP.
-- Launcher verifies a nonce-based server identity proof before sending credentials.
-- Chat tokens rotate on service restart. Fetch a fresh link after a restart;
-  previously issued links may no longer work. The port/path stay stable if free.
-- Source identity is checked on the same file descriptor on each read. Symlink
-  replacement is rejected. The observer never modifies Codex transcripts.
-- No reasoning, system/developer context or binary image payloads are rendered.
-- Common credentials and home usernames are masked best-effort, **not a guarantee
-  that arbitrary prose is safe to share**. Tool outputs can contain sensitive text.
-- Never publish a real screenshot, token URL, transcript, runtime state or backup
-  without reviewing it. This repo's screenshot is synthetic.
-
-This is local HTTP, not an authenticated HTTPS origin or a sandbox against local
-malware. A hostile process under the same user can read the underlying logs/state.
-Another local process that takes over a stopped port can serve a fake page; token
-rotation prevents old tokens from accessing a future legitimate service, but do
-not enter private data into an unverified page. Stop using the observer if your
-local host is untrusted.
-
-## Development
-
-```sh
-python3 -B -m unittest discover -s tests -v
-python3 demo.py
-```
-
-The demo creates fictional events in a temporary directory and serves the real
-UI; it never reads your Codex logs. The runtime uses the Python standard library
-and self-contained HTML/CSS/JS. No npm install, CDN, telemetry or remote font.
-
-## Status and credits
-
-**v0.2.1: experimental standalone observer.** Rollout schemas and hook support
-vary by Codex version. Automated tests cover fixtures and installation boundaries,
-not every host/version. Global auto-registration still needs a host-trusted hook.
-
-Born from [KnowledgeOS](https://github.com/Fly-Carrot/KnowledgeOS), kept independent
-of its kernel. Visual interaction inspired by the MIT-licensed
-[DeepSeek Harness trajectory UI](https://github.com/deepseek-ai/deepseek-harness/tree/master/packages/client/ui-trajectory).
-Independent implementation; no affiliation with OpenAI or DeepSeek. A Codex plugin
-could later distribute this same observer, but it is not an agent Skill or MCP
-server and does not require either to run.
-
-See [CHANGELOG.md](CHANGELOG.md) and [SECURITY.md](SECURITY.md).
+MIT licensed. See [SECURITY.md](SECURITY.md).

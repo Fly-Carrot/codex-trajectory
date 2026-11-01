@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 .DS_Store
 .knowledgeos-local/
+.claude-trajectory-local/
 *.jsonl
 *.ndjson
 connection.json
