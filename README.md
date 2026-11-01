@@ -17,6 +17,17 @@ No API key.
 | [`codex/`](codex/README.md) | Codex desktop and CLI | `codex-trajectory` | v0.3.0 preview |
 | [`claude/`](claude/README.md) | Claude Code (desktop and CLI) | `claude-trajectory` | 0.1.x preview |
 
+**Codex**
+
+[![Codex timeline with category rows and linked tool results.](codex/docs/preview.jpg)](codex/README.md)
+
+**Claude Code**
+
+[![Claude Code timeline with category rows and an event inspector.](claude/docs/preview.jpg)](claude/README.md)
+
+*Both screenshots use fictional demonstration data, not real conversations.
+Click a preview for that observer's setup and usage instructions.*
+
 The two implementations are independent: separate installers, hooks, runtime
 directories, URL schemes and recovery apps. Installing one never changes the other.
 Run each folder's commands from inside that folder, for example:
